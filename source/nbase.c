@@ -385,6 +385,20 @@ int proof_number_comp     (const mvlist_t *a,
     return  -1;
 }
 
+//本文用変化手順の攻方着手。最短、同手数なら駒余りを優先する。
+int researched_line_comp  (const mvlist_t *a,
+                           const mvlist_t *b,
+                           const sdata_t  *s)
+{
+    if(a->tdata.pn < b->tdata.pn) return -1;
+    if(a->tdata.pn > b->tdata.pn) return  1;
+    if(a->tdata.sh < b->tdata.sh) return -1;
+    if(a->tdata.sh > b->tdata.sh) return  1;
+    if(a->inc > b->inc) return -1;
+    if(a->inc < b->inc) return  1;
+    return proof_number_comp(a, b, s);
+}
+
 //玉方着手の並べ替え
 int disproof_number_comp  (const mvlist_t *a,
                            const mvlist_t *b,

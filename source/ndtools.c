@@ -50,23 +50,40 @@ typedef struct {
     unsigned int terminal_ply;
 } json_line_result_t;
 
+typedef struct json_baseline_line {
+    unsigned int branch_ply;
+    move_t defender_move;
+    FILE *stream;
+    json_line_result_t result;
+    bool first_move;
+    struct json_baseline_line *next;
+} json_baseline_line_t;
+
+static json_baseline_line_t *st_json_baselines;
+static bool st_json_capture_baselines;
+
 static mvlist_t* json_prepare_or(const sdata_t *sdata, tbase_t *tbase);
+static mvlist_t* json_optimize_or(
+    mvlist_t *list, const sdata_t *sdata, tbase_t *tbase);
 static mvlist_t* json_prepare_and(const sdata_t *sdata, tbase_t *tbase);
 static json_line_result_t json_emit_line_or(
-    FILE *stream, const sdata_t *sdata, tbase_t *tbase, bool *first_move);
+    FILE *stream, const sdata_t *sdata, tbase_t *tbase, bool *first_move,
+    bool research_lines);
 static json_line_result_t json_emit_line_and(
-    FILE *stream, const sdata_t *sdata, tbase_t *tbase, bool *first_move);
+    FILE *stream, const sdata_t *sdata, tbase_t *tbase, bool *first_move,
+    bool research_lines);
 static bool json_collect_variations_or(
     FILE *stream, const sdata_t *sdata, tbase_t *tbase, bool *first_variation,
     const move_t *principal, unsigned int principal_length,
-    bool *principal_valid);
+    bool research_lines, bool *principal_valid);
 static bool json_collect_variations_and(
     FILE *stream, const sdata_t *sdata, tbase_t *tbase, bool *first_variation,
     const move_t *principal, unsigned int principal_length,
-    bool *principal_valid);
+    bool research_lines, bool *principal_valid);
 static void json_emit_move(
     FILE *stream, move_t move, bool *first_move);
 static mvlist_t* json_select_move(mvlist_t *list, move_t move);
+static void json_free_baselines(json_baseline_line_t *list);
 
 /*
  * 探索情報の表示
@@ -272,15 +289,33 @@ int tsume_fprint                (FILE            *stream,
 bool tsume_json_variations_fprint(
     FILE *stream, const sdata_t *sdata, tbase_t *tbase,
     const move_t *principal, unsigned int principal_length,
+    bool research_lines,
     bool *principal_valid)
 {
     bool first_variation = true;
     *principal_valid = true;
+    st_json_baselines = NULL;
+    if(research_lines){
+        FILE *baseline_output = tmpfile();
+        if(baseline_output){
+            bool baseline_first = true;
+            bool baseline_principal_valid = true;
+            st_json_capture_baselines = true;
+            json_collect_variations_or(
+                baseline_output, sdata, tbase, &baseline_first,
+                principal, principal_length, false,
+                &baseline_principal_valid);
+            st_json_capture_baselines = false;
+            fclose(baseline_output);
+        }
+    }
     fprintf(stream, "[");
     bool complete = json_collect_variations_or(
         stream, sdata, tbase, &first_variation, principal, principal_length,
-        principal_valid);
+        research_lines, principal_valid);
     fprintf(stream, "]");
+    json_free_baselines(st_json_baselines);
+    st_json_baselines = NULL;
     return complete;
 }
 
@@ -306,6 +341,33 @@ static mvlist_t* json_prepare_or(const sdata_t *sdata, tbase_t *tbase)
         tmp = tmp->next;
     }
     return sdata_mvlist_sort(list, sdata, proof_number_comp);
+}
+
+static mvlist_t* json_optimize_or(
+    mvlist_t *list, const sdata_t *sdata, tbase_t *tbase)
+{
+    mvlist_t *best = list;
+    while(best && best->tdata.pn) best = best->next;
+    if(!best) return list;
+
+    mvlist_t *candidate = list;
+    while(candidate){
+        if(candidate != best){
+            tdata_t threshold = {
+                INFINATE-1, INFINATE-1, best->tdata.sh + 1
+            };
+            sdata_t child;
+            memcpy(&child, sdata, sizeof(sdata_t));
+            sdata_move_forward(&child, candidate->mlist->move);
+            bns_and(&child, &threshold, candidate, tbase);
+            if(!candidate->tdata.pn &&
+               researched_line_comp(candidate, best, sdata) < 0){
+                best = candidate;
+            }
+        }
+        candidate = candidate->next;
+    }
+    return sdata_mvlist_sort(list, sdata, researched_line_comp);
 }
 
 static mvlist_t* json_prepare_and(const sdata_t *sdata, tbase_t *tbase)
@@ -341,6 +403,17 @@ static void json_emit_move(FILE *stream, move_t move, bool *first_move)
     *first_move = false;
 }
 
+static bool json_copy_file(FILE *destination, FILE *source)
+{
+    char buffer[1024];
+    size_t count;
+    rewind(source);
+    while((count = fread(buffer, 1, sizeof(buffer), source)) > 0){
+        if(fwrite(buffer, 1, count, destination) != count) return false;
+    }
+    return !ferror(source);
+}
+
 static mvlist_t* json_select_move(mvlist_t *list, move_t move)
 {
     mvlist_t *selected = list;
@@ -353,7 +426,8 @@ static mvlist_t* json_select_move(mvlist_t *list, move_t move)
 }
 
 static json_line_result_t json_emit_line_or(
-    FILE *stream, const sdata_t *sdata, tbase_t *tbase, bool *first_move)
+    FILE *stream, const sdata_t *sdata, tbase_t *tbase, bool *first_move,
+    bool research_lines)
 {
     json_line_result_t result = {true, false, S_COUNT(sdata)};
     if(S_COUNT(sdata) >= TSUME_MAX_DEPTH){
@@ -362,6 +436,8 @@ static json_line_result_t json_emit_line_or(
     }
 
     mvlist_t *list = json_prepare_or(sdata, tbase);
+    if(research_lines && list && !list->tdata.pn)
+        list = json_optimize_or(list, sdata, tbase);
     if(!list || list->tdata.pn){
         result.complete = false;
         if(list) mvlist_free(list);
@@ -373,13 +449,15 @@ static json_line_result_t json_emit_line_or(
     sdata_t sbuf;
     memcpy(&sbuf, sdata, sizeof(sdata_t));
     sdata_move_forward(&sbuf, move);
-    result = json_emit_line_and(stream, &sbuf, tbase, first_move);
+    result = json_emit_line_and(
+        stream, &sbuf, tbase, first_move, research_lines);
     mvlist_free(list);
     return result;
 }
 
 static json_line_result_t json_emit_line_and(
-    FILE *stream, const sdata_t *sdata, tbase_t *tbase, bool *first_move)
+    FILE *stream, const sdata_t *sdata, tbase_t *tbase, bool *first_move,
+    bool research_lines)
 {
     json_line_result_t result = {true, false, S_COUNT(sdata)};
     if(S_COUNT(sdata) >= TSUME_MAX_DEPTH){
@@ -403,15 +481,99 @@ static json_line_result_t json_emit_line_and(
     sdata_t sbuf;
     memcpy(&sbuf, sdata, sizeof(sdata_t));
     sdata_move_forward(&sbuf, move);
-    result = json_emit_line_or(stream, &sbuf, tbase, first_move);
+    result = json_emit_line_or(
+        stream, &sbuf, tbase, first_move, research_lines);
     mvlist_free(list);
+    return result;
+}
+
+static json_baseline_line_t* json_capture_baseline(
+    unsigned int branch_ply, move_t defender_move,
+    const sdata_t *branch, tbase_t *tbase)
+{
+    json_baseline_line_t *baseline = malloc(sizeof(json_baseline_line_t));
+    if(!baseline) return NULL;
+    baseline->branch_ply = branch_ply;
+    baseline->defender_move = defender_move;
+    baseline->stream = tmpfile();
+    baseline->result = (json_line_result_t){
+        false, false, branch_ply
+    };
+    baseline->first_move = false;
+    baseline->next = st_json_baselines;
+    if(baseline->stream){
+        baseline->result = json_emit_line_or(
+            baseline->stream, branch, tbase,
+            &baseline->first_move, false);
+    }
+    st_json_baselines = baseline;
+    return baseline;
+}
+
+static json_baseline_line_t* json_find_baseline(
+    unsigned int branch_ply, move_t defender_move)
+{
+    json_baseline_line_t *list = st_json_baselines;
+    while(list &&
+          (list->branch_ply != branch_ply ||
+           list->defender_move.prev_pos != defender_move.prev_pos ||
+           list->defender_move.new_pos != defender_move.new_pos))
+        list = list->next;
+    return list;
+}
+
+static void json_free_baselines(json_baseline_line_t *list)
+{
+    while(list){
+        json_baseline_line_t *next = list->next;
+        if(list->stream) fclose(list->stream);
+        free(list);
+        list = next;
+    }
+}
+
+static json_line_result_t json_emit_researched_line_or(
+    FILE *stream, const sdata_t *sdata, tbase_t *tbase, bool *first_move,
+    json_baseline_line_t *baseline, bool *used_research)
+{
+    *used_research = false;
+    if(!baseline || !baseline->stream)
+        return json_emit_line_or(
+            stream, sdata, tbase, first_move, false);
+
+    FILE *research_stream = tmpfile();
+    if(!research_stream){
+        json_line_result_t result = baseline->result;
+        *first_move = baseline->first_move;
+        if(!json_copy_file(stream, baseline->stream)) result.complete = false;
+        return result;
+    }
+
+    bool research_first = *first_move;
+    json_line_result_t researched = json_emit_line_or(
+        research_stream, sdata, tbase, &research_first, true);
+
+    bool choose_research =
+        researched.complete && researched.mate &&
+        (!baseline->result.complete || !baseline->result.mate ||
+         researched.terminal_ply <= baseline->result.terminal_ply);
+    FILE *selected_stream =
+        choose_research ? research_stream : baseline->stream;
+    json_line_result_t result =
+        choose_research ? researched : baseline->result;
+    *first_move =
+        choose_research ? research_first : baseline->first_move;
+    *used_research = choose_research;
+    if(!json_copy_file(stream, selected_stream)) result.complete = false;
+
+    fclose(research_stream);
     return result;
 }
 
 static bool json_collect_variations_or(
     FILE *stream, const sdata_t *sdata, tbase_t *tbase, bool *first_variation,
     const move_t *principal, unsigned int principal_length,
-    bool *principal_valid)
+    bool research_lines, bool *principal_valid)
 {
     if(S_COUNT(sdata) >= TSUME_MAX_DEPTH){
         *principal_valid = false;
@@ -451,7 +613,7 @@ static bool json_collect_variations_or(
     sdata_move_forward(&sbuf, selected->mlist->move);
     bool complete = json_collect_variations_and(
         stream, &sbuf, tbase, first_variation, principal, principal_length,
-        principal_valid);
+        research_lines, principal_valid);
     mvlist_free(list);
     return complete;
 }
@@ -459,7 +621,7 @@ static bool json_collect_variations_or(
 static bool json_collect_variations_and(
     FILE *stream, const sdata_t *sdata, tbase_t *tbase, bool *first_variation,
     const move_t *principal, unsigned int principal_length,
-    bool *principal_valid)
+    bool research_lines, bool *principal_valid)
 {
     if(S_COUNT(sdata) >= TSUME_MAX_DEPTH){
         *principal_valid = false;
@@ -530,12 +692,43 @@ static bool json_collect_variations_and(
             sdata_t branch;
             memcpy(&branch, sdata, sizeof(sdata_t));
             sdata_move_forward(&branch, alternative->mlist->move);
-            result = json_emit_line_or(stream, &branch, tbase, &first_move);
+            bool used_research = false;
+            if(st_json_capture_baselines){
+                json_baseline_line_t *baseline = json_capture_baseline(
+                    S_COUNT(sdata)+1, alternative->mlist->move,
+                    &branch, tbase);
+                if(baseline && baseline->stream){
+                    result = baseline->result;
+                    first_move = baseline->first_move;
+                    if(!json_copy_file(stream, baseline->stream))
+                        result.complete = false;
+                } else {
+                    result = json_emit_line_or(
+                        stream, &branch, tbase, &first_move, false);
+                }
+            } else if(research_lines){
+                result = json_emit_researched_line_or(
+                    stream, &branch, tbase, &first_move,
+                    json_find_baseline(
+                        S_COUNT(sdata)+1, alternative->mlist->move),
+                    &used_research);
+            } else {
+                result = json_emit_line_or(
+                    stream, &branch, tbase, &first_move, false);
+            }
+            fprintf(stream, "]");
+            if(result.mate){
+                fprintf(stream, ",\"terminal_ply\":%u", result.terminal_ply);
+            }
+            fprintf(stream, ",\"line_search\":\"%s\"",
+                    used_research
+                        ? "bounded_attacker_candidates"
+                        : "proof_tree_order");
+        } else {
+            fprintf(stream, "]");
+            fprintf(stream, ",\"line_search\":\"proof_tree_order\"");
         }
-        fprintf(stream, "]");
-        if(result.mate){
-            fprintf(stream, ",\"terminal_ply\":%u", result.terminal_ply);
-        }
+        fprintf(stream, ",\"line_optimality\":\"unverified\"");
         fprintf(stream, ",\"complete\":%s}", result.complete ? "true" : "false");
         if(!result.complete || !result.mate) complete = false;
         *first_variation = false;
@@ -547,7 +740,8 @@ static bool json_collect_variations_and(
     sdata_move_forward(&next_state, selected->mlist->move);
     if(!json_collect_variations_or(
         stream, &next_state, tbase, first_variation,
-        principal, principal_length, principal_valid)) complete = false;
+        principal, principal_length, research_lines,
+        principal_valid)) complete = false;
     mvlist_free(list);
     return complete;
 }

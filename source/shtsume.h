@@ -331,6 +331,9 @@ void mvlist_print(mvlist_t *mvlist, sdata_t *sdata, int flag);
 int proof_number_comp     (const mvlist_t *a,
                            const mvlist_t *b,
                            const sdata_t  *s );
+int researched_line_comp  (const mvlist_t *a,
+                           const mvlist_t *b,
+                           const sdata_t  *s );
 int disproof_number_comp  (const mvlist_t *a,
                            const mvlist_t *b,
                            const sdata_t  *s );

@@ -84,6 +84,7 @@ bool tsume_json_variations_fprint(FILE           *stream,
                                   tbase_t         *tbase,
                                   const move_t    *principal,
                                   unsigned int     principal_length,
+                                  bool             research_lines,
                                   bool            *principal_valid);
         
 //初手から局面ごとに表示

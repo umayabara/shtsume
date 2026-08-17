@@ -29,6 +29,7 @@ bool        g_json_output;
 
 static bool st_display;
 static bool st_json;
+static bool st_research_lines;
 static char *st_principal_string;
 static const struct option longopts[] =
 {
@@ -40,6 +41,7 @@ static const struct option longopts[] =
      {"log",     no_argument,        NULL,   'g'},  //g_summary
      {"display", no_argument,        NULL,   'd'},  //st_display
      {"json",    no_argument,        NULL,   'J'},  //st_json
+     {"research-lines", no_argument, NULL,   'O'},  //st_research_lines
      {"principal", required_argument, NULL,  'P'},  //st_principal_string
      {"yomi",    no_argument,        NULL,   'y'},  //g_disp_search
      {"all",     no_argument,        NULL,   'a'},  //g_smode
@@ -63,7 +65,7 @@ int main(int argc, char * const argv[]) {
     int optc;
     g_info_interval = 5;
     g_pv_length     = PV_LENGTH_DEFAULT;
-    while((optc = getopt_long(argc, argv, "hvkgdJyaP:n:m:l:i:j:t:",
+    while((optc = getopt_long(argc, argv, "hvkgdJyOaP:n:m:l:i:j:t:",
                               longopts, NULL))!= -1)
         switch(optc){
             case 'h':
@@ -79,6 +81,7 @@ int main(int argc, char * const argv[]) {
             case 'g': g_summary = true;     break;
             case 'd': st_display = true;    break;
             case 'J': st_json = true;       break;
+            case 'O': st_research_lines = true; break;
             case 'P': st_principal_string = optarg; break;
             case 'y': g_disp_search = true; break;
             case 'a': g_smode = (TP_NONE|TP_ALLMOVE); break;
@@ -277,6 +280,10 @@ int main(int argc, char * const argv[]) {
             printf(",\"redundant\":%s", g_redundant ? "true" : "false");
             printf(",\"futile_interposition_pruning\":\"builtin\"");
             printf(",\"variation_collection\":\"single_proof_tree\"");
+            printf(",\"variation_line_search\":\"%s\"",
+                   st_research_lines
+                       ? "bounded_attacker_candidates"
+                       : "proof_tree_order");
             printf(",\"variation_line_optimality\":\"unverified\"");
             printf(",\"search_config\":{\"memory_mb\":%llu"
                    ",\"min_proof_number\":%u,\"level\":%u}",
@@ -315,7 +322,8 @@ int main(int argc, char * const argv[]) {
                     tsume_json_variations_fprint(
                         stdout, &g_sdata, g_tbase,
                         requested_principal_length ? requested_principal : NULL,
-                        requested_principal_length, &principal_valid);
+                        requested_principal_length, st_research_lines,
+                        &principal_valid);
                 printf(",\"principal_variation_valid\":%s",
                        principal_valid ? "true" : "false");
                 printf(",\"variations_complete\":%s",
