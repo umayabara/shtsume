@@ -77,7 +77,7 @@ void tsearchinf_update          (const sdata_t *sdata,
     g_tsearchinf.depth = S_COUNT(sdata);
     g_tsearchinf.score_cp = g_root_pn;
 
-    if(!g_commandline ||g_disp_search)
+    if((!g_commandline || g_disp_search) && !g_json_output)
     {
         tsearchpn_sprintf(g_str);
         record_log(g_str);

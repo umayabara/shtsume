@@ -80,7 +80,7 @@ void print_help                (void)
      " 使用法１: %s \n"
      "         USIに準拠した詰将棋エンジンとして使用する事ができます。\n"
      " 使用法２: コマンドラインより\n"
-     "         %s [-hvkgdy][-n pn][-m size][-l lv][-i limit]\n"
+     "         %s [-hvkgdJy][-n pn][-m size][-l lv][-i limit]\n"
      "            [-j dep][-t int] sfen_string\n"
      "　       sfen_stringで指定された局面について詰探索を試みます。\n"
      " [サポートオプション]\n"
@@ -92,6 +92,7 @@ void print_help                (void)
      " g,log    : 探索LOGを出力します。           \n"
      " 注）k,gオプションでの出力先はホームディレクトリ（Mac）またはインストール先(Win)\n"
      " d,display: 詰み発見時、探索後に手順確認モードへ移行します。\n"
+     " J,json   : 検索結果を JSON で 1 行出力します。\n"
      " y,yomi   : 探索中、読み筋表示。\n"
      " a,all    : 探索LOGで詰方全ての候補手の探索結果を出力します。\n"
      " [値指定]\n"
@@ -215,7 +216,7 @@ void bn_search                  (const sdata_t   *sdata,
                     g_tsearchinf.nodes,
                     st_add_thpn);
             record_log(g_str);
-            puts(g_str);
+            if(!g_json_output) puts(g_str);
             if(g_out_lvkif){
                 sprintf(filename,"%s/tsumelv%d.kif",
                         g_user_path,g_search_level-lv);
@@ -244,7 +245,8 @@ void bn_search                  (const sdata_t   *sdata,
                 sprintf(g_str,"info string Checkmate with hand! "
                               "(Output is only a sample.)\n");
             }
-            record_log(g_str); puts(g_str);
+            record_log(g_str);
+            if(!g_json_output) puts(g_str);
         }
         tsearchpv_update(sdata, tbase);
         if(g_commandline && g_out_lvkif){
@@ -256,7 +258,7 @@ void bn_search                  (const sdata_t   *sdata,
     if(g_error){
         sprintf(g_str, "info string search error occured.");
         record_log(g_str);
-        puts(g_str);
+        if(!g_json_output) puts(g_str);
     }
     
     return;
@@ -268,6 +270,15 @@ void bns_or                     (const sdata_t   *sdata,
                                  tbase_t         *tbase )
 {
     bn_search_or(sdata, th_tdata, mvlist, tbase);
+    return;
+}
+
+void bns_and                    (const sdata_t   *sdata,
+                                 tdata_t         *th_tdata,
+                                 mvlist_t        *mvlist,
+                                 tbase_t         *tbase )
+{
+    bn_search_and(sdata, th_tdata, mvlist, tbase);
     return;
 }
 
@@ -422,7 +433,7 @@ void bn_search_or               (const sdata_t   *sdata,
             move_to_sfen(mv_str, g_tsearchinf.mvinf[S_COUNT(sdata)].move);
             sprintf(g_str, "info currmove %s\n", mv_str);
             record_log(g_str);
-            puts(g_str);
+            if(!g_json_output) puts(g_str);
         }
         //証明数、反証数等の更新
         mvlist->tdata.pn = list->tdata.pn;
@@ -915,8 +926,10 @@ void make_tree_or               (const sdata_t   *sdata,
     while(list->tdata.pn){
         if(list->tdata.pn >= INFINATE-1){
             SDATA_PRINTF(sdata,PR_BOARD);
-            printf("info string error occured at %s line %d",
-                   __FILE__,__LINE__);
+            if(!g_json_output){
+                printf("info string error occured at %s line %d",
+                       __FILE__,__LINE__);
+            }
             exit(EXIT_FAILURE);
         }
         if(list->next) thdata.pn = MIN(INFINATE-1,(list->next)->tdata.pn+1);
@@ -999,7 +1012,7 @@ void make_tree_or               (const sdata_t   *sdata,
                 sprintf(g_str,
                         "search error occured. %s",
                         g_errorlog_name);
-            puts(g_str);
+            if(!g_json_output) puts(g_str);
             record_log(g_str);
             exit(EXIT_FAILURE);
         }
@@ -1517,4 +1530,3 @@ void bns_plus_and               (const sdata_t   *sdata,
     mvlist_free(list);
     return;
 }
-

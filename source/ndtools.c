@@ -44,6 +44,30 @@ static void gen_kif_file_and    (FILE *restrict  stream,
                                  tbase_t         *tbase,
                                  move_t           prev );
 
+typedef struct {
+    bool complete;
+    bool mate;
+    unsigned int terminal_ply;
+} json_line_result_t;
+
+static mvlist_t* json_prepare_or(const sdata_t *sdata, tbase_t *tbase);
+static mvlist_t* json_prepare_and(const sdata_t *sdata, tbase_t *tbase);
+static json_line_result_t json_emit_line_or(
+    FILE *stream, const sdata_t *sdata, tbase_t *tbase, bool *first_move);
+static json_line_result_t json_emit_line_and(
+    FILE *stream, const sdata_t *sdata, tbase_t *tbase, bool *first_move);
+static bool json_collect_variations_or(
+    FILE *stream, const sdata_t *sdata, tbase_t *tbase, bool *first_variation,
+    const move_t *principal, unsigned int principal_length,
+    bool *principal_valid);
+static bool json_collect_variations_and(
+    FILE *stream, const sdata_t *sdata, tbase_t *tbase, bool *first_variation,
+    const move_t *principal, unsigned int principal_length,
+    bool *principal_valid);
+static void json_emit_move(
+    FILE *stream, move_t move, bool *first_move);
+static mvlist_t* json_select_move(mvlist_t *list, move_t move);
+
 /*
  * 探索情報の表示
  * 探索深さ、着手、証明数、反証数、
@@ -245,6 +269,289 @@ int tsume_fprint                (FILE            *stream,
     return num;
 }
 
+bool tsume_json_variations_fprint(
+    FILE *stream, const sdata_t *sdata, tbase_t *tbase,
+    const move_t *principal, unsigned int principal_length,
+    bool *principal_valid)
+{
+    bool first_variation = true;
+    *principal_valid = true;
+    fprintf(stream, "[");
+    bool complete = json_collect_variations_or(
+        stream, sdata, tbase, &first_variation, principal, principal_length,
+        principal_valid);
+    fprintf(stream, "]");
+    return complete;
+}
+
+static mvlist_t* json_prepare_or(const sdata_t *sdata, tbase_t *tbase)
+{
+    MAKE_TREE_SET_PROTECT(sdata, S_TURN(sdata), tbase);
+    mvlist_t *list = generate_check(sdata, tbase);
+    if(!list) return NULL;
+
+    sdata_t sbuf;
+    mvlist_t *tmp = list;
+    while(tmp){
+        memcpy(&sbuf, sdata, sizeof(sdata_t));
+        sdata_key_forward(&sbuf, tmp->mlist->move);
+        make_tree_lookup(&sbuf, tmp, S_TURN(sdata), tbase);
+        tmp->length =
+            g_distance[ENEMY_OU(sdata)][NEW_POS(tmp->mlist->move)];
+        if(tmp->length > 1 &&
+           tmp->tdata.pn == 1 &&
+           tmp->tdata.dn == 1 &&
+           tmp->tdata.sh == 0 &&
+           MV_DROP(tmp->mlist->move)) tmp->tdata.pn = tmp->length;
+        tmp = tmp->next;
+    }
+    return sdata_mvlist_sort(list, sdata, proof_number_comp);
+}
+
+static mvlist_t* json_prepare_and(const sdata_t *sdata, tbase_t *tbase)
+{
+    mvlist_t *list = generate_evasion(sdata, tbase);
+    if(!list) return NULL;
+
+    turn_t tn = TURN_FLIP(S_TURN(sdata));
+    sdata_t sbuf;
+    mvlist_t *tmp = list;
+    while(tmp){
+        memcpy(&sbuf, sdata, sizeof(sdata_t));
+        sdata_key_forward(&sbuf, tmp->mlist->move);
+        make_tree_lookup(&sbuf, tmp, tn, tbase);
+        if(tmp->mlist->next){
+            mvlist_t *expanded = mvlist_alloc();
+            expanded->mlist = tmp->mlist->next;
+            tmp->mlist->next = NULL;
+            expanded->next = tmp->next;
+            tmp->next = expanded;
+        }
+        tmp = tmp->next;
+    }
+    return sdata_mvlist_sort(list, sdata, disproof_number_comp);
+}
+
+static void json_emit_move(FILE *stream, move_t move, bool *first_move)
+{
+    char move_string[16];
+    move_to_sfen(move_string, move);
+    if(!*first_move) fprintf(stream, ",");
+    fprintf(stream, "\"%s\"", move_string);
+    *first_move = false;
+}
+
+static mvlist_t* json_select_move(mvlist_t *list, move_t move)
+{
+    mvlist_t *selected = list;
+    while(selected){
+        if(selected->mlist->move.prev_pos == move.prev_pos &&
+           selected->mlist->move.new_pos == move.new_pos) return selected;
+        selected = selected->next;
+    }
+    return NULL;
+}
+
+static json_line_result_t json_emit_line_or(
+    FILE *stream, const sdata_t *sdata, tbase_t *tbase, bool *first_move)
+{
+    json_line_result_t result = {true, false, S_COUNT(sdata)};
+    if(S_COUNT(sdata) >= TSUME_MAX_DEPTH){
+        result.complete = false;
+        return result;
+    }
+
+    mvlist_t *list = json_prepare_or(sdata, tbase);
+    if(!list || list->tdata.pn){
+        result.complete = false;
+        if(list) mvlist_free(list);
+        return result;
+    }
+
+    move_t move = list->mlist->move;
+    json_emit_move(stream, move, first_move);
+    sdata_t sbuf;
+    memcpy(&sbuf, sdata, sizeof(sdata_t));
+    sdata_move_forward(&sbuf, move);
+    result = json_emit_line_and(stream, &sbuf, tbase, first_move);
+    mvlist_free(list);
+    return result;
+}
+
+static json_line_result_t json_emit_line_and(
+    FILE *stream, const sdata_t *sdata, tbase_t *tbase, bool *first_move)
+{
+    json_line_result_t result = {true, false, S_COUNT(sdata)};
+    if(S_COUNT(sdata) >= TSUME_MAX_DEPTH){
+        result.complete = false;
+        return result;
+    }
+
+    mvlist_t *list = json_prepare_and(sdata, tbase);
+    if(!list){
+        result.mate = true;
+        return result;
+    }
+    if(list->tdata.pn){
+        result.complete = false;
+        mvlist_free(list);
+        return result;
+    }
+
+    move_t move = list->mlist->move;
+    json_emit_move(stream, move, first_move);
+    sdata_t sbuf;
+    memcpy(&sbuf, sdata, sizeof(sdata_t));
+    sdata_move_forward(&sbuf, move);
+    result = json_emit_line_or(stream, &sbuf, tbase, first_move);
+    mvlist_free(list);
+    return result;
+}
+
+static bool json_collect_variations_or(
+    FILE *stream, const sdata_t *sdata, tbase_t *tbase, bool *first_variation,
+    const move_t *principal, unsigned int principal_length,
+    bool *principal_valid)
+{
+    if(S_COUNT(sdata) >= TSUME_MAX_DEPTH){
+        *principal_valid = false;
+        return false;
+    }
+    mvlist_t *list = json_prepare_or(sdata, tbase);
+    if(!list || list->tdata.pn){
+        *principal_valid = false;
+        if(list) mvlist_free(list);
+        return false;
+    }
+
+    mvlist_t *selected = list;
+    if(principal && S_COUNT(sdata) >= principal_length){
+        *principal_valid = false;
+        mvlist_free(list);
+        return false;
+    }
+    if(principal && S_COUNT(sdata) < principal_length){
+        selected = json_select_move(list, principal[S_COUNT(sdata)]);
+    }
+    if(selected && selected->tdata.pn){
+        sdata_t recovery;
+        tdata_t threshold = {INFINATE-1, INFINATE-1, TSUME_MAX_DEPTH};
+        memcpy(&recovery, sdata, sizeof(sdata_t));
+        sdata_move_forward(&recovery, selected->mlist->move);
+        bns_and(&recovery, &threshold, selected, tbase);
+    }
+    if(!selected || selected->tdata.pn){
+        *principal_valid = false;
+        mvlist_free(list);
+        return false;
+    }
+
+    sdata_t sbuf;
+    memcpy(&sbuf, sdata, sizeof(sdata_t));
+    sdata_move_forward(&sbuf, selected->mlist->move);
+    bool complete = json_collect_variations_and(
+        stream, &sbuf, tbase, first_variation, principal, principal_length,
+        principal_valid);
+    mvlist_free(list);
+    return complete;
+}
+
+static bool json_collect_variations_and(
+    FILE *stream, const sdata_t *sdata, tbase_t *tbase, bool *first_variation,
+    const move_t *principal, unsigned int principal_length,
+    bool *principal_valid)
+{
+    if(S_COUNT(sdata) >= TSUME_MAX_DEPTH){
+        *principal_valid = false;
+        return false;
+    }
+    mvlist_t *list = json_prepare_and(sdata, tbase);
+    if(!list){
+        if(principal && S_COUNT(sdata) != principal_length){
+            *principal_valid = false;
+            return false;
+        }
+        return true;
+    }
+
+    mvlist_t *selected = list;
+    if(principal && S_COUNT(sdata) >= principal_length){
+        *principal_valid = false;
+        mvlist_free(list);
+        return false;
+    }
+    if(principal && S_COUNT(sdata) < principal_length){
+        selected = json_select_move(list, principal[S_COUNT(sdata)]);
+    }
+    if(selected && selected->tdata.pn){
+        sdata_t recovery;
+        tdata_t threshold = {INFINATE-1, INFINATE-1, TSUME_MAX_DEPTH};
+        memcpy(&recovery, sdata, sizeof(sdata_t));
+        sdata_move_forward(&recovery, selected->mlist->move);
+        bns_or(&recovery, &threshold, selected, tbase);
+    }
+    if(!selected || selected->tdata.pn){
+        *principal_valid = false;
+        mvlist_free(list);
+        return false;
+    }
+
+    bool complete = true;
+    mvlist_t *alternative = list;
+    while(alternative){
+        if(alternative == selected){
+            alternative = alternative->next;
+            continue;
+        }
+        char defender_move[16];
+        move_to_sfen(defender_move, alternative->mlist->move);
+        if(!*first_variation) fprintf(stream, ",");
+        fprintf(stream,
+                "{\"branch_ply\":%u,\"defender_move\":\"%s\""
+                ",\"proof_number\":%u,\"disproof_number\":%u"
+                ",\"search_depth\":%u,\"surplus_piece\":%s"
+                ",\"surplus_count\":%u,\"line\":[",
+                S_COUNT(sdata)+1,
+                defender_move,
+                alternative->tdata.pn,
+                alternative->tdata.dn,
+                alternative->tdata.sh,
+                alternative->inc ? "true" : "false",
+                alternative->nouse2);
+
+        bool first_move = true;
+        json_emit_move(stream, alternative->mlist->move, &first_move);
+        json_line_result_t result = {
+            alternative->tdata.pn == 0,
+            false,
+            S_COUNT(sdata)+1
+        };
+        if(alternative->tdata.pn == 0){
+            sdata_t branch;
+            memcpy(&branch, sdata, sizeof(sdata_t));
+            sdata_move_forward(&branch, alternative->mlist->move);
+            result = json_emit_line_or(stream, &branch, tbase, &first_move);
+        }
+        fprintf(stream, "]");
+        if(result.mate){
+            fprintf(stream, ",\"terminal_ply\":%u", result.terminal_ply);
+        }
+        fprintf(stream, ",\"complete\":%s}", result.complete ? "true" : "false");
+        if(!result.complete || !result.mate) complete = false;
+        *first_variation = false;
+        alternative = alternative->next;
+    }
+
+    sdata_t next_state;
+    memcpy(&next_state, sdata, sizeof(sdata_t));
+    sdata_move_forward(&next_state, selected->mlist->move);
+    if(!json_collect_variations_or(
+        stream, &next_state, tbase, first_variation,
+        principal, principal_length, principal_valid)) complete = false;
+    mvlist_free(list);
+    return complete;
+}
+
 void tsume_debug                (const sdata_t   *sdata,
                                  tbase_t         *tbase)
 {
@@ -263,9 +570,11 @@ void generate_kif_file          (const char      *filename,
     fp = fopen(filename, "w");
     if(!fp){
         //エラー処理
-        printf("info string I/O error:%s\n", strerror(errno));
-        printf("info string %s\n",filename);
-        printf("info string kif_file could't be created.\n");
+        if(!g_json_output){
+            printf("info string I/O error:%s\n", strerror(errno));
+            printf("info string %s\n",filename);
+            printf("info string kif_file could't be created.\n");
+        }
         return;
     }
     //コメント表記　プログラム名　バージョン

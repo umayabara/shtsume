@@ -489,14 +489,20 @@ int create_search_report(void)
     FILE *fp = fopen(filename, "w");
     if(!fp){
         if(g_commandline){
-            num += fprintf
-            (stdout,"info string error search_report could not be opened.");
+            if(g_json_output){
+                num += fprintf
+                (stderr,"info string error search_report could not be opened.");
+            }
+            else{
+                num += fprintf
+                (stdout,"info string error search_report could not be opened.");
+            }
         }
         else{
             sprintf
             (g_str, "info string error search_report could not be opened.");
             record_log(g_str);
-            puts(g_str);
+            if(!g_json_output) puts(g_str);
         }
         return num;
     }

@@ -53,6 +53,7 @@ extern bool                 g_summary;
 extern bool                 g_disp_search;
 extern uint32_t             g_smode;
 extern bool                 g_commandline;
+extern bool                 g_json_output;
 
 #define TSUME_MAX_DEPTH     2000
 #define MAKE_TREE_NUM       2
@@ -462,6 +463,10 @@ void bn_search                  (const sdata_t   *sdata,
 void bns_or                     (const sdata_t   *sdata,
                                  tdata_t      *th_tdata,
                                  mvlist_t       *mvlist,
+                                 tbase_t         *tbase );
+void bns_and                    (const sdata_t   *sdata,
+                                 tdata_t         *th_tdata,
+                                 mvlist_t        *mvlist,
                                  tbase_t         *tbase );
 void make_tree                  (const sdata_t   *sdata,
                                  mvlist_t       *mvlist,

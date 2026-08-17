@@ -21,12 +21,15 @@
  グローバル変数
  -------------- */
 bool        g_commandline;       /* true: commandline  false:  usi-mode  */
+bool        g_json_output;
 
 /* --------------
  スタティック変数
  -------------- */
 
 static bool st_display;
+static bool st_json;
+static char *st_principal_string;
 static const struct option longopts[] =
 {
  //サポートオプション
@@ -36,6 +39,8 @@ static const struct option longopts[] =
      {"kifu",    no_argument,        NULL,   'k'},  //g_out_lvkif
      {"log",     no_argument,        NULL,   'g'},  //g_summary
      {"display", no_argument,        NULL,   'd'},  //st_display
+     {"json",    no_argument,        NULL,   'J'},  //st_json
+     {"principal", required_argument, NULL,  'P'},  //st_principal_string
      {"yomi",    no_argument,        NULL,   'y'},  //g_disp_search
      {"all",     no_argument,        NULL,   'a'},  //g_smode
  //値指定
@@ -58,7 +63,7 @@ int main(int argc, char * const argv[]) {
     int optc;
     g_info_interval = 5;
     g_pv_length     = PV_LENGTH_DEFAULT;
-    while((optc = getopt_long(argc, argv, "hvkgdyan:m:l:i:j:t:",
+    while((optc = getopt_long(argc, argv, "hvkgdJyaP:n:m:l:i:j:t:",
                               longopts, NULL))!= -1)
         switch(optc){
             case 'h':
@@ -73,6 +78,8 @@ int main(int argc, char * const argv[]) {
             case 'k': g_out_lvkif = true;   break;
             case 'g': g_summary = true;     break;
             case 'd': st_display = true;    break;
+            case 'J': st_json = true;       break;
+            case 'P': st_principal_string = optarg; break;
             case 'y': g_disp_search = true; break;
             case 'a': g_smode = (TP_NONE|TP_ALLMOVE); break;
                 
@@ -126,6 +133,13 @@ int main(int argc, char * const argv[]) {
     // コマンドラインアプリとして起動
     else{
         g_commandline   = true;
+        g_json_output   = st_json;
+        if(g_json_output){
+            g_disp_search = false;
+            g_out_lvkif = false;
+            g_summary = false;
+            st_display = false;
+        }
         //char p_string[128];
         strncpy(g_sfen_pos_str, argv[optind], strlen(argv[optind]));
         char *home = getenv("HOME");
@@ -145,28 +159,66 @@ int main(int argc, char * const argv[]) {
         init_bpos();                          //bitboard
         init_effect();                        //effect
         srand((unsigned)time(NULL));
-        
+
         //詰将棋条件の表示
         ssdata_t ssdata;
         sfen_to_ssdata(g_sfen_pos_str, &ssdata);
         initialize_sdata(&g_sdata, &ssdata);
-        printf("-----局面図-----\n");
-        SDATA_PRINTF(&g_sdata, PR_BOARD);
+        move_t requested_principal[TSUME_MAX_DEPTH];
+        unsigned int requested_principal_length = 0;
+        if(st_principal_string){
+            char principal_buffer[TSUME_MAX_DEPTH*7];
+            strncpy(principal_buffer, st_principal_string,
+                    sizeof(principal_buffer)-1);
+            principal_buffer[sizeof(principal_buffer)-1] = '\0';
+            char *token = strtok(principal_buffer, " ");
+            while(token &&
+                  requested_principal_length < TSUME_MAX_DEPTH){
+                char move_buffer[8];
+                snprintf(move_buffer, sizeof(move_buffer), "%s ", token);
+                sfen_to_move(
+                    &requested_principal[requested_principal_length],
+                    move_buffer);
+                requested_principal_length++;
+                token = strtok(NULL, " ");
+            }
+        }
+        if(!st_json){
+            printf("-----局面図-----\n");
+            SDATA_PRINTF(&g_sdata, PR_BOARD);
+        }
         
         //局面の合法性check
         int err = is_sdata_illegal(&g_sdata);
         if(err){
-            printf("局面エラー: ");
-            switch(err){
-                case CHECKED:
-                    printf("すでに相手玉に王手がかかった局面です。\n");
-                    break;
-                case NIFU:
-                    printf("二歩のある局面です。\n");
-                    break;
-                case ILL_POS:
-                    printf("行きどころの無い駒があります。\n");
-                    break;
+            if(st_json){
+                const char *message = NULL;
+                switch(err){
+                    case CHECKED:
+                        message = "すでに相手玉に王手がかかった局面です。";
+                        break;
+                    case NIFU:
+                        message = "二歩のある局面です。";
+                        break;
+                    case ILL_POS:
+                        message = "行きどころの無い駒があります。";
+                        break;
+                }
+                printf("{\"status\":\"error\",\"error_code\":%d,\"message\":\"%s\"}\n",
+                       err, message ? message : "局面エラー");
+            } else {
+                printf("局面エラー: ");
+                switch(err){
+                    case CHECKED:
+                        printf("すでに相手玉に王手がかかった局面です。\n");
+                        break;
+                    case NIFU:
+                        printf("二歩のある局面です。\n");
+                        break;
+                    case ILL_POS:
+                        printf("行きどころの無い駒があります。\n");
+                        break;
+                }
             }
             return 1;
         }
@@ -175,34 +227,36 @@ int main(int argc, char * const argv[]) {
         uint64_t size = g_usi_hash*MCARDS_PER_MBYTE-1;
         g_tbase = create_tbase(size);
         g_mtt = create_mtt(MTT_SIZE);
-        
-        //探索条件の表示
-        printf("---------探索条件---------\n");
-        printf("局面表 %llu(MByte)\n",g_usi_hash);
-        printf("探索レベル %u\n", g_search_level);
         if(!g_time_limit) g_time_limit = TM_INFINATE;
-        if(g_time_limit<0) printf("探索時間 制限なし\n");
-        else printf("探索時間 %d(sec)\n",g_time_limit/1000);
-        printf("読み筋表示 ");
-        if(g_disp_search) printf("あり\n");
-        else              printf("なし\n");
-        if(g_disp_search){
-            printf("表示間隔 %ld(sec)\n", g_info_interval);
-            printf("表示深さ %d\n", g_pv_length);
+
+        if(!st_json){
+            //探索条件の表示
+            printf("---------探索条件---------\n");
+            printf("局面表 %llu(MByte)\n",g_usi_hash);
+            printf("探索レベル %u\n", g_search_level);
+            if(g_time_limit<0) printf("探索時間 制限なし\n");
+            else printf("探索時間 %d(sec)\n",g_time_limit/1000);
+            printf("読み筋表示 ");
+            if(g_disp_search) printf("あり\n");
+            else              printf("なし\n");
+            if(g_disp_search){
+                printf("表示間隔 %ld(sec)\n", g_info_interval);
+                printf("表示深さ %d\n", g_pv_length);
+            }
+            printf("棋譜出力 ");
+            if(g_out_lvkif)   printf("あり\n");
+            else              printf("なし\n");
+            printf("ログ出力 ");
+            if(g_summary)     printf("あり\n");
+            else              printf("なし\n");
+            if(g_out_lvkif||g_summary){
+                printf("出力先: %s\n", g_user_path);
+            }
+            printf("手順確認 ");
+            if(st_display)     printf("あり\n");
+            else               printf("なし\n");
+            printf("-------------------------\n");
         }
-        printf("棋譜出力 ");
-        if(g_out_lvkif)   printf("あり\n");
-        else              printf("なし\n");
-        printf("ログ出力 ");
-        if(g_summary)     printf("あり\n");
-        else              printf("なし\n");
-        if(g_out_lvkif||g_summary){
-            printf("出力先: %s\n", g_user_path);
-        }
-        printf("手順確認 ");
-        if(st_display)     printf("あり\n");
-        else               printf("なし\n");
-        printf("-------------------------\n");
         //詰探索
         clock_t start = clock();
         tdata_t tdata;
@@ -211,7 +265,64 @@ int main(int argc, char * const argv[]) {
         
         clock_t finish = clock();
         
-        if(!tdata.pn){
+        if(st_json){
+            int num = 0;
+            char mvstr[16];
+            const char *status;
+            if(!tdata.pn)      status = "mate";
+            else if(!tdata.dn) status = "no_mate";
+            else               status = "unknown";
+            printf("{");
+            printf("\"status\":\"%s\"", status);
+            printf(",\"redundant\":%s", g_redundant ? "true" : "false");
+            printf(",\"futile_interposition_pruning\":\"builtin\"");
+            printf(",\"variation_collection\":\"single_proof_tree\"");
+            printf(",\"variation_line_optimality\":\"unverified\"");
+            printf(",\"search_config\":{\"memory_mb\":%llu"
+                   ",\"min_proof_number\":%u,\"level\":%u}",
+                   g_usi_hash, g_mt_min_pn, g_search_level);
+            if(!tdata.pn){
+                printf(",\"mate_in\":%u", tdata.sh);
+            }
+            else{
+                printf(",\"proof_number\":%u", tdata.pn);
+                printf(",\"disproof_number\":%u", tdata.dn);
+                printf(",\"search_depth\":%u", tdata.sh);
+            }
+            printf(",\"elapsed_sec\":%lu", (finish-start)/CLOCKS_PER_SEC);
+            printf(",\"nodes\":%llu", g_tsearchinf.nodes);
+            printf(",\"tree_nodes\":%llu", g_tbase->pr_num);
+            printf(",\"table_entries\":%llu", g_tbase->num);
+            printf(",\"principal_variation\":[");
+            unsigned int output_principal_length =
+                requested_principal_length ? requested_principal_length
+                                           : TSUME_MAX_DEPTH;
+            for(unsigned int i=0; i<output_principal_length; i++){
+                move_t mv = requested_principal_length
+                    ? requested_principal[i]
+                    : g_tsearchinf.mvinf[i].move;
+                if(mv.prev_pos == 0 && mv.new_pos == 0) break;
+                if(MV_TORYO(mv)) break;
+                if(num++) printf(",");
+                move_to_sfen(mvstr, mv);
+                printf("\"%s\"", mvstr);
+            }
+            printf("]");
+            if(!tdata.pn){
+                printf(",\"variations\":");
+                bool principal_valid;
+                bool variations_complete =
+                    tsume_json_variations_fprint(
+                        stdout, &g_sdata, g_tbase,
+                        requested_principal_length ? requested_principal : NULL,
+                        requested_principal_length, &principal_valid);
+                printf(",\"principal_variation_valid\":%s",
+                       principal_valid ? "true" : "false");
+                printf(",\"variations_complete\":%s",
+                       variations_complete ? "true" : "false");
+            }
+            printf("}\n");
+        } else if(!tdata.pn){
             //詰手順、探索情報表示
             if(g_redundant){
                 printf("詰みました。駒余りのため詰手順は参考。\n");

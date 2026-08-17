@@ -78,6 +78,13 @@ int tsume_fprint                (FILE            *stream,
                                  const sdata_t   *sdata,
                                  tbase_t         *tbase,
                                  unsigned int     flag );
+
+bool tsume_json_variations_fprint(FILE           *stream,
+                                  const sdata_t   *sdata,
+                                  tbase_t         *tbase,
+                                  const move_t    *principal,
+                                  unsigned int     principal_length,
+                                  bool            *principal_valid);
         
 //初手から局面ごとに表示
 void tsume_debug                (const sdata_t   *sdata,

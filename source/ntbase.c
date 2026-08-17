@@ -271,16 +271,17 @@ void tbase_gc              (tbase_t  *tbase)
     //ガベージコレクション実施宣言
     sprintf(g_str, "%sGarbage collection start. ",prefix);
     record_log(g_str); 
-    puts(g_str);
+    if(!g_json_output) puts(g_str);
     sprintf(g_str, "%ssize:%llu del_target:%llu protected:%llu gc_num:%d ",
             prefix,tbase->sz_elm, gc_target, tbase->pr_num, g_gc_num);
     record_log(g_str);
-    puts(g_str);
+    if(!g_json_output) puts(g_str);
     do{
         if(gc_level>g_gc_max_level) g_gc_max_level = gc_level;
         //gc_level出力
         sprintf(g_str, "%sgc_level:%u", prefix, gc_level);
-        record_log(g_str); puts(g_str);
+        record_log(g_str);
+        if(!g_json_output) puts(g_str);
         counter_reset();
         //gc実行部
         for(i=0; i<tbase->sz_tbl; i++)
@@ -356,21 +357,26 @@ void tbase_gc              (tbase_t  *tbase)
         }
         //gc_summary表示
         sprintf(g_str, "%smate    %d/%d", prefix,st_del_tsumi, st_n_tsumi);
-        record_log(g_str); puts(g_str);
+        record_log(g_str);
+        if(!g_json_output) puts(g_str);
         sprintf(g_str, "%snomate  %d/%d", prefix,st_del_fudumi, st_n_fudumi);
-        record_log(g_str); puts(g_str);
+        record_log(g_str);
+        if(!g_json_output) puts(g_str);
         sprintf(g_str, "%sunknown %d/%d", prefix,st_del_fumei, st_n_fumei);
-        record_log(g_str); puts(g_str);
+        record_log(g_str);
+        if(!g_json_output) puts(g_str);
         sprintf(g_str,"%sdelete_num/gc_target %llu/%llu",
                 prefix, delete_num, gc_target);
-        record_log(g_str); puts(g_str);
+        record_log(g_str);
+        if(!g_json_output) puts(g_str);
         if(delete_num>gc_target) break;
         if((st_n_tsumi-st_del_tsumi>n_tsumi_max) &&
            (gc_level>=(g_root_pn/2))                )
         {
             st_tsumi_delete_flag = true;
             sprintf(g_str, "delete 1step mate." );
-            record_log(g_str); puts(g_str);
+            record_log(g_str);
+            if(!g_json_output) puts(g_str);
         }
         else gc_level++;
     } while(true);
@@ -389,10 +395,10 @@ void tbase_gc              (tbase_t  *tbase)
             );
     
     record_log(g_str);
-    puts(g_str);
+            if(!g_json_output) puts(g_str);
     sprintf(g_str, "%sGarbage collection end.\n",prefix);
     record_log(g_str);
-    puts(g_str);
+            if(!g_json_output) puts(g_str);
     tbase->num -= delete_num;
     g_gc_num++;
     return;
