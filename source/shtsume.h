@@ -471,6 +471,10 @@ void bns_and                    (const sdata_t   *sdata,
                                  tdata_t         *th_tdata,
                                  mvlist_t        *mvlist,
                                  tbase_t         *tbase );
+void bns_and_isolated           (const sdata_t   *sdata,
+                                 tdata_t         *th_tdata,
+                                 mvlist_t        *mvlist,
+                                 tbase_t         *tbase );
 void make_tree                  (const sdata_t   *sdata,
                                  mvlist_t       *mvlist,
                                  tbase_t         *tbase);

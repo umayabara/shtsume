@@ -94,6 +94,8 @@ void print_help                (void)
      " d,display: 詰み発見時、探索後に手順確認モードへ移行します。\n"
      " J,json   : 検索結果を JSON で 1 行出力します。\n"
      " O,research-lines: JSON変化の攻方候補を現行線の手数上限内で再探索します。\n"
+     " x,analyze-exclusivity: JSON変化の各手順について、選択された攻方着手が\n"
+     "                        唯一の詰み筋かどうかを追加探索して判定します。\n"
      " y,yomi   : 探索中、読み筋表示。\n"
      " a,all    : 探索LOGで詰方全ての候補手の探索結果を出力します。\n"
      " [値指定]\n"
@@ -281,6 +283,56 @@ void bns_and                    (const sdata_t   *sdata,
 {
     bn_search_and(sdata, th_tdata, mvlist, tbase);
     return;
+}
+
+void bns_and_isolated           (const sdata_t   *sdata,
+                                 tdata_t         *th_tdata,
+                                 mvlist_t        *mvlist,
+                                 tbase_t         *tbase )
+{
+    tsearchinf_t saved_tsearchinf = g_tsearchinf;
+    clock_t saved_prev_update = g_prev_update;
+    uint64_t saved_prev_nodes = g_prev_nodes;
+    bool saved_suspend = g_suspend;
+    bool saved_error = g_error;
+    bool saved_stop_received = g_stop_received;
+    bool saved_redundant = g_redundant;
+    unsigned int saved_root_pn = g_root_pn;
+    unsigned int saved_root_max = g_root_max;
+    int saved_loop = g_loop;
+    short saved_gc_max_level = g_gc_max_level;
+    short saved_gc_num = g_gc_num;
+    clock_t saved_start = st_start;
+    unsigned int saved_max_depth = st_max_depth;
+    unsigned int saved_max_thpn = st_max_thpn;
+    unsigned int saved_max_thdn = st_max_thdn;
+    unsigned int saved_add_thpn = st_add_thpn;
+    unsigned int saved_max_tsh = st_max_tsh;
+    unsigned int saved_max_dsh = st_max_dsh;
+    bool saved_symmetry = st_symmetry;
+
+    bn_search_and(sdata, th_tdata, mvlist, tbase);
+
+    g_tsearchinf = saved_tsearchinf;
+    g_prev_update = saved_prev_update;
+    g_prev_nodes = saved_prev_nodes;
+    g_suspend = saved_suspend;
+    g_error = saved_error;
+    g_stop_received = saved_stop_received;
+    g_redundant = saved_redundant;
+    g_root_pn = saved_root_pn;
+    g_root_max = saved_root_max;
+    g_loop = saved_loop;
+    g_gc_max_level = saved_gc_max_level;
+    g_gc_num = saved_gc_num;
+    st_start = saved_start;
+    st_max_depth = saved_max_depth;
+    st_max_thpn = saved_max_thpn;
+    st_max_thdn = saved_max_thdn;
+    st_add_thpn = saved_add_thpn;
+    st_max_tsh = saved_max_tsh;
+    st_max_dsh = saved_max_dsh;
+    st_symmetry = saved_symmetry;
 }
 
 void make_tree                  (const sdata_t   *sdata,
