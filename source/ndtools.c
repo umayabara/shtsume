@@ -77,25 +77,38 @@ typedef enum {
     JSON_EXCLUSIVITY_UNVERIFIED
 } json_exclusivity_status_t;
 
+typedef enum {
+    JSON_BOUNDED_NO_MATE,
+    JSON_BOUNDED_MATE,
+    JSON_BOUNDED_ABORTED
+} json_bounded_mate_status_t;
+
 /* 一局面での王手候補数は将棋の合法手数の範囲で十分な余裕を持たせる */
 #define JSON_EXCLUSIVITY_MAX_ALT   200
 
-/*
- * 排他性判定のための追加探索において、選択済み手順の詰み手数
- * (list->tdata.sh)に対して許容する深さの余裕。反証(不詰の証明)は
- * 全分岐の消尽を要し証明よりはるかに高コストなため、TSUME_MAX_DEPTH
- * まで無制限に許すと現実的な時間で終わらない候補が生じ得る。ここで
- * 有限のマージンを設けることで、選択手より大幅に長い別詰みの可能性は
- * "unverified" として扱われる(不詰とは断定しない)。
- */
+/* 一般手の追加DFPN探索に許容する探索高の余裕。 */
 #define JSON_EXCLUSIVITY_DEPTH_MARGIN   20
+/*
+ * 線駒打ちの代案は固定深さ探索に加え、小さい証明数閾値でも調べる。
+ * これにより同手数の別詰みを拾いつつ、不詰候補の完全反証で停止しない。
+ */
+#define JSON_EXCLUSIVITY_PROOF_PN_LIMIT 16
 
 typedef struct json_exclusivity_entry {
     unsigned int ply;                 /* 攻方着手の手数(1始まり)        */
     move_t       move;                /* 実際に選択された着手           */
     json_exclusivity_status_t status;
+    bool         same_piece_drop_scope;
     unsigned int alternative_count;   /* 選択手以外の合法な王手候補数    */
+    unsigned int selected_mate_moves; /* 選択手から詰みまでの手数         */
+    unsigned int comparison_search_plies;
+    bool has_unresolved_alternatives; /* 追加探索後も未解決の候補があるか */
+    move_t       alternatives[JSON_EXCLUSIVITY_MAX_ALT];
+    tdata_t      alternative_results[JSON_EXCLUSIVITY_MAX_ALT];
+    bool         alternative_bounded_out[JSON_EXCLUSIVITY_MAX_ALT];
     move_t       proven_mating[JSON_EXCLUSIVITY_MAX_ALT];
+    unsigned int proven_mating_moves[JSON_EXCLUSIVITY_MAX_ALT];
+    char        *proven_mating_lines[JSON_EXCLUSIVITY_MAX_ALT];
     unsigned int proven_mating_count; /* 詰みと証明された他候補の数     */
     struct json_exclusivity_entry *next;
 } json_exclusivity_entry_t;
@@ -104,6 +117,7 @@ typedef struct {
     bool complete;
     bool mate;
     unsigned int terminal_ply;
+    unsigned int attacker_hand_count;
     json_exclusivity_entry_t *exclusivity; /* 手順中の各攻方着手の排他性 */
     bool exclusivity_complete;
 } json_line_result_t;
@@ -120,17 +134,28 @@ typedef struct json_baseline_line {
 static json_baseline_line_t *st_json_baselines;
 static bool st_json_capture_baselines;
 static tbase_t *st_json_exclusivity_tbase;
+static json_exclusivity_entry_t *st_json_principal_exclusivity;
 
 static mvlist_t* json_prepare_or(const sdata_t *sdata, tbase_t *tbase);
 static mvlist_t* json_optimize_or(
     mvlist_t *list, const sdata_t *sdata, tbase_t *tbase);
 static mvlist_t* json_prepare_and(const sdata_t *sdata, tbase_t *tbase);
+static json_bounded_mate_status_t json_bounded_mate_or(
+    const sdata_t *sdata, unsigned int remaining, tbase_t *tbase);
+static json_bounded_mate_status_t json_bounded_mate_and(
+    const sdata_t *sdata, unsigned int remaining, tbase_t *tbase);
 static json_line_result_t json_emit_line_or(
     FILE *stream, const sdata_t *sdata, tbase_t *tbase, bool *first_move,
     bool research_lines, bool analyze_exclusivity);
 static json_line_result_t json_emit_line_and(
     FILE *stream, const sdata_t *sdata, tbase_t *tbase, bool *first_move,
     bool research_lines, bool analyze_exclusivity);
+static json_line_result_t json_emit_optimal_or(
+    FILE *stream, const sdata_t *sdata, tbase_t *tbase, bool *first_move,
+    unsigned int remaining, bool analyze_exclusivity);
+static json_line_result_t json_emit_optimal_and(
+    FILE *stream, const sdata_t *sdata, tbase_t *tbase, bool *first_move,
+    unsigned int remaining, bool analyze_exclusivity);
 static bool json_collect_variations_or(
     FILE *stream, const sdata_t *sdata, tbase_t *tbase, bool *first_variation,
     const move_t *principal, unsigned int principal_length,
@@ -360,9 +385,10 @@ bool tsume_json_variations_fprint(
     bool first_variation = true;
     *principal_valid = true;
     st_json_baselines = NULL;
+    st_json_principal_exclusivity = NULL;
     st_json_exclusivity_tbase = analyze_exclusivity
         ? create_tbase(
-            MIN(tbase->sz_elm, 16 * MCARDS_PER_MBYTE - 1))
+            MIN(tbase->sz_elm, 64 * MCARDS_PER_MBYTE - 1))
         : NULL;
     if(research_lines){
         FILE *baseline_output = tmpfile();
@@ -383,6 +409,12 @@ bool tsume_json_variations_fprint(
         stream, sdata, tbase, &first_variation, principal, principal_length,
         research_lines, analyze_exclusivity, principal_valid);
     fprintf(stream, "]");
+    if(analyze_exclusivity){
+        fprintf(stream, ",\"principal_attacker_move_exclusivity\":");
+        json_print_exclusivity(stream, st_json_principal_exclusivity);
+        json_free_exclusivity(st_json_principal_exclusivity);
+        st_json_principal_exclusivity = NULL;
+    }
     json_free_baselines(st_json_baselines);
     st_json_baselines = NULL;
     if(st_json_exclusivity_tbase){
@@ -467,6 +499,107 @@ static mvlist_t* json_prepare_and(const sdata_t *sdata, tbase_t *tbase)
     return sdata_mvlist_sort(list, sdata, disproof_number_comp);
 }
 
+static json_bounded_mate_status_t json_bounded_mate_or(
+    const sdata_t *sdata, unsigned int remaining, tbase_t *tbase)
+{
+    if(g_suspend || g_stop_received) return JSON_BOUNDED_ABORTED;
+    if(remaining == 0) return JSON_BOUNDED_NO_MATE;
+
+    mvlist_t *list = generate_check(sdata, tbase);
+    mvlist_t *candidate = list;
+    json_bounded_mate_status_t result = JSON_BOUNDED_NO_MATE;
+    while(candidate){
+        sdata_t child;
+        memcpy(&child, sdata, sizeof(sdata_t));
+        sdata_move_forward(&child, candidate->mlist->move);
+        json_bounded_mate_status_t child_result =
+            json_bounded_mate_and(&child, remaining - 1, tbase);
+        if(child_result != JSON_BOUNDED_NO_MATE){
+            result = child_result;
+            break;
+        }
+        candidate = candidate->next;
+    }
+    if(list) mvlist_free(list);
+    return result;
+}
+
+static json_bounded_mate_status_t json_bounded_mate_and(
+    const sdata_t *sdata, unsigned int remaining, tbase_t *tbase)
+{
+    if(g_suspend || g_stop_received) return JSON_BOUNDED_ABORTED;
+
+    /*
+     * generate_evasion が同一の無駄合系列を mlist->next にまとめる。
+     * 固定手数比較ではその系列を個別の2手として数えず、代表だけを調べる。
+     */
+    mvlist_t *list = generate_evasion(sdata, tbase);
+    if(!list) return JSON_BOUNDED_MATE;
+    if(remaining == 0){
+        mvlist_free(list);
+        return JSON_BOUNDED_NO_MATE;
+    }
+
+    mvlist_t *evasion = list;
+    json_bounded_mate_status_t result = JSON_BOUNDED_MATE;
+    while(evasion){
+        sdata_t child;
+        memcpy(&child, sdata, sizeof(sdata_t));
+        sdata_move_forward(&child, evasion->mlist->move);
+        json_bounded_mate_status_t child_result =
+            json_bounded_mate_or(&child, remaining - 1, tbase);
+        if(child_result != JSON_BOUNDED_MATE){
+            result = child_result;
+            break;
+        }
+        evasion = evasion->next;
+    }
+    mvlist_free(list);
+    return result;
+}
+
+static bool json_exact_mate_or(
+    const sdata_t *sdata, unsigned int remaining, tbase_t *tbase,
+    bool *aborted)
+{
+    json_bounded_mate_status_t within =
+        json_bounded_mate_or(sdata, remaining, tbase);
+    if(within == JSON_BOUNDED_ABORTED){
+        *aborted = true;
+        return false;
+    }
+    if(within != JSON_BOUNDED_MATE) return false;
+    if(!remaining) return true;
+    json_bounded_mate_status_t shorter =
+        json_bounded_mate_or(sdata, remaining - 1, tbase);
+    if(shorter == JSON_BOUNDED_ABORTED){
+        *aborted = true;
+        return false;
+    }
+    return shorter != JSON_BOUNDED_MATE;
+}
+
+static bool json_exact_mate_and(
+    const sdata_t *sdata, unsigned int remaining, tbase_t *tbase,
+    bool *aborted)
+{
+    json_bounded_mate_status_t within =
+        json_bounded_mate_and(sdata, remaining, tbase);
+    if(within == JSON_BOUNDED_ABORTED){
+        *aborted = true;
+        return false;
+    }
+    if(within != JSON_BOUNDED_MATE) return false;
+    if(!remaining) return true;
+    json_bounded_mate_status_t shorter =
+        json_bounded_mate_and(sdata, remaining - 1, tbase);
+    if(shorter == JSON_BOUNDED_ABORTED){
+        *aborted = true;
+        return false;
+    }
+    return shorter != JSON_BOUNDED_MATE;
+}
+
 static void json_emit_move(FILE *stream, move_t move, bool *first_move)
 {
     char move_string[16];
@@ -527,23 +660,137 @@ static json_exclusivity_entry_t* json_analyze_or_exclusivity(
     entry->ply = ply;
     entry->move = selected_move;
     entry->status = JSON_EXCLUSIVITY_EXCLUSIVE;
+    entry->same_piece_drop_scope = (
+        MV_DROP(selected_move) &&
+        (MV_HAND(selected_move) == KY ||
+         MV_HAND(selected_move) == KA ||
+         MV_HAND(selected_move) == HI)
+    );
     entry->alternative_count = 0;
+    entry->selected_mate_moves = list->tdata.sh;
+    entry->comparison_search_plies = 0;
+    entry->has_unresolved_alternatives = false;
     entry->proven_mating_count = 0;
+    for(unsigned int i=0; i<JSON_EXCLUSIVITY_MAX_ALT; i++)
+        entry->alternative_bounded_out[i] = false;
+    for(unsigned int i=0; i<JSON_EXCLUSIVITY_MAX_ALT; i++)
+        entry->proven_mating_lines[i] = NULL;
     entry->next = NULL;
 
+    sdata_t selected_child;
+    memcpy(&selected_child, sdata, sizeof(sdata_t));
+    sdata_move_forward(&selected_child, selected_move);
+    FILE *selected_stream = tmpfile();
+    if(selected_stream){
+        bool first_selected_move = true;
+        json_line_result_t selected_result = json_emit_line_and(
+            selected_stream, &selected_child, tbase,
+            &first_selected_move, true, false);
+        if(selected_result.complete && selected_result.mate)
+            entry->selected_mate_moves =
+                selected_result.terminal_ply - ply + 1;
+        fclose(selected_stream);
+    }
+
+    bool same_piece_drop_scope = entry->same_piece_drop_scope;
     bool any_unresolved = false;
-    unsigned int depth_limit = list->tdata.sh + JSON_EXCLUSIVITY_DEPTH_MARGIN;
+    bool selected_bound_found = !same_piece_drop_scope;
+    unsigned int selected_bound_remaining =
+        entry->selected_mate_moves > 0
+            ? entry->selected_mate_moves - 1
+            : 0;
+    if(same_piece_drop_scope && st_json_exclusivity_tbase){
+        unsigned int max_remaining = selected_bound_remaining +
+            JSON_EXCLUSIVITY_DEPTH_MARGIN;
+        if(max_remaining > TSUME_MAX_DEPTH ||
+           max_remaining < selected_bound_remaining)
+            max_remaining = TSUME_MAX_DEPTH;
+        for(unsigned int remaining = selected_bound_remaining;
+            remaining <= max_remaining;
+            remaining++){
+            initialize_tbase(st_json_exclusivity_tbase);
+            json_bounded_mate_status_t selected_result =
+                json_bounded_mate_and(
+                    &selected_child, remaining,
+                    st_json_exclusivity_tbase);
+            if(selected_result == JSON_BOUNDED_MATE){
+                selected_bound_remaining = remaining;
+                selected_bound_found = true;
+                entry->comparison_search_plies = remaining + 1;
+                break;
+            }
+            if(selected_result == JSON_BOUNDED_ABORTED) break;
+        }
+    }
+    unsigned int depth_limit = same_piece_drop_scope
+        ? entry->selected_mate_moves
+        : list->tdata.sh + JSON_EXCLUSIVITY_DEPTH_MARGIN;
     if(depth_limit > TSUME_MAX_DEPTH || depth_limit < list->tdata.sh)
         depth_limit = TSUME_MAX_DEPTH;
     tdata_t threshold = {INFINATE-1, INFINATE-1, depth_limit};
     mvlist_t *candidate = list;
     while(candidate){
+        if(same_piece_drop_scope &&
+           candidate->mlist->move.prev_pos != selected_move.prev_pos){
+            candidate = candidate->next;
+            continue;
+        }
         if(candidate->mlist->move.prev_pos != selected_move.prev_pos ||
            candidate->mlist->move.new_pos  != selected_move.new_pos){
-            entry->alternative_count++;
+            unsigned int alternative_index = entry->alternative_count++;
             tdata_t candidate_result = candidate->tdata;
-            if(candidate_result.pn != 0 && candidate_result.dn != 0 &&
-               st_json_exclusivity_tbase){
+            tbase_t *candidate_tbase = tbase;
+            sdata_t child;
+            memcpy(&child, sdata, sizeof(sdata_t));
+            sdata_move_forward(&child, candidate->mlist->move);
+            bool bounded_out = false;
+            bool bounded_mate = false;
+            if(same_piece_drop_scope && st_json_exclusivity_tbase &&
+               selected_bound_found){
+                initialize_tbase(st_json_exclusivity_tbase);
+                json_bounded_mate_status_t bounded_result =
+                    json_bounded_mate_and(
+                        &child, selected_bound_remaining,
+                        st_json_exclusivity_tbase);
+                if(bounded_result == JSON_BOUNDED_MATE){
+                    candidate_result =
+                        (tdata_t){0, INFINATE-1,
+                                  entry->selected_mate_moves};
+                    bounded_mate = true;
+                } else if(bounded_result == JSON_BOUNDED_NO_MATE){
+                    initialize_tbase(st_json_exclusivity_tbase);
+                    mvlist_t probe = *candidate;
+                    tdata_t proof_threshold = {
+                        JSON_EXCLUSIVITY_PROOF_PN_LIMIT,
+                        INFINATE-1,
+                        TSUME_MAX_DEPTH
+                    };
+                    probe.next = NULL;
+                    probe.tdata = (tdata_t){1, 1, 0};
+                    probe.hinc = 0;
+                    probe.inc = 0;
+                    probe.nouse = 0;
+                    probe.nouse2 = 0;
+                    bns_and_isolated(
+                        &child, &proof_threshold, &probe,
+                        st_json_exclusivity_tbase);
+                    if(probe.tdata.pn == 0){
+                        candidate_result = probe.tdata;
+                        candidate_tbase = st_json_exclusivity_tbase;
+                    } else {
+                        candidate_result =
+                            (tdata_t){probe.tdata.pn,
+                                      probe.tdata.dn,
+                                      entry->selected_mate_moves};
+                        bounded_out = true;
+                    }
+                }
+            } else if(same_piece_drop_scope){
+                candidate_result = (tdata_t){1, 1, 0};
+            } else if(
+                candidate_result.pn != 0 &&
+                candidate_result.dn != 0 &&
+                st_json_exclusivity_tbase){
                 initialize_tbase(st_json_exclusivity_tbase);
                 mvlist_t probe = *candidate;
                 probe.next = NULL;
@@ -552,21 +799,89 @@ static json_exclusivity_entry_t* json_analyze_or_exclusivity(
                 probe.inc = 0;
                 probe.nouse = 0;
                 probe.nouse2 = 0;
-                sdata_t child;
-                memcpy(&child, sdata, sizeof(sdata_t));
-                sdata_move_forward(&child, candidate->mlist->move);
                 bns_and_isolated(
                     &child, &threshold, &probe,
                     st_json_exclusivity_tbase);
                 candidate_result = probe.tdata;
+                candidate_tbase = st_json_exclusivity_tbase;
+            }
+            if(alternative_index < JSON_EXCLUSIVITY_MAX_ALT){
+                entry->alternatives[alternative_index] =
+                    candidate->mlist->move;
+                entry->alternative_results[alternative_index] =
+                    candidate_result;
+                entry->alternative_bounded_out[alternative_index] =
+                    bounded_out;
             }
             if(candidate_result.pn == 0){
+                bool mating_line_complete = bounded_mate;
                 if(entry->proven_mating_count < JSON_EXCLUSIVITY_MAX_ALT){
+                    unsigned int mating_index =
+                        entry->proven_mating_count;
                     entry->proven_mating[entry->proven_mating_count] =
                         candidate->mlist->move;
+                    entry->proven_mating_moves[mating_index] =
+                        candidate_result.sh;
+                    memcpy(&child, sdata, sizeof(sdata_t));
+                    sdata_move_forward(
+                        &child, candidate->mlist->move);
+                    FILE *line_stream = bounded_mate ? NULL : tmpfile();
+                    if(line_stream){
+                        bool first_line_move = true;
+                        json_line_result_t line_result =
+                            json_emit_line_and(
+                                line_stream, &child,
+                                candidate_tbase, &first_line_move,
+                                true, false);
+                        if(line_result.complete && line_result.mate){
+                            mating_line_complete = true;
+                            entry->proven_mating_moves[mating_index] =
+                                line_result.terminal_ply - ply + 1;
+                        }
+                        fflush(line_stream);
+                        if(fseek(line_stream, 0, SEEK_END) == 0){
+                            long line_length = ftell(line_stream);
+                            if(line_length >= 0 &&
+                               fseek(line_stream, 0, SEEK_SET) == 0){
+                                char *line = malloc(
+                                    (size_t)line_length + 1);
+                                if(line){
+                                    size_t read_length = fread(
+                                        line, 1, (size_t)line_length,
+                                        line_stream);
+                                    line[read_length] = '\0';
+                                    entry->proven_mating_lines[
+                                        mating_index
+                                    ] = line;
+                                }
+                            }
+                        }
+                        fclose(line_stream);
+                    }
                 }
-                entry->proven_mating_count++;
-            } else if(candidate_result.dn != 0){
+                if(mating_line_complete){
+                    entry->proven_mating_count++;
+                } else {
+                    if(entry->proven_mating_count <
+                       JSON_EXCLUSIVITY_MAX_ALT){
+                        unsigned int mating_index =
+                            entry->proven_mating_count;
+                        free(entry->proven_mating_lines[mating_index]);
+                        entry->proven_mating_lines[mating_index] = NULL;
+                    }
+                    candidate_result =
+                        (tdata_t){1, 1, entry->selected_mate_moves};
+                    bounded_out = true;
+                    if(alternative_index < JSON_EXCLUSIVITY_MAX_ALT){
+                        entry->alternative_results[alternative_index] =
+                            candidate_result;
+                        entry->alternative_bounded_out[alternative_index] =
+                            true;
+                    }
+                }
+            } else if(
+                candidate_result.dn != 0 &&
+                !bounded_out){
                 /* pn!=0 かつ dn!=0: 追加探索でも未解決のまま */
                 any_unresolved = true;
             }
@@ -580,6 +895,7 @@ static json_exclusivity_entry_t* json_analyze_or_exclusivity(
         entry->status = JSON_EXCLUSIVITY_UNVERIFIED;
     else
         entry->status = JSON_EXCLUSIVITY_EXCLUSIVE;
+    entry->has_unresolved_alternatives = any_unresolved;
     return entry;
 }
 
@@ -587,6 +903,11 @@ static void json_free_exclusivity(json_exclusivity_entry_t *list)
 {
     while(list){
         json_exclusivity_entry_t *next = list->next;
+        unsigned int shown = MIN(
+            list->proven_mating_count,
+            JSON_EXCLUSIVITY_MAX_ALT);
+        for(unsigned int i=0; i<shown; i++)
+            free(list->proven_mating_lines[i]);
         free(list);
         list = next;
     }
@@ -606,7 +927,7 @@ static const char* json_exclusivity_status_string(
 static void json_print_exclusivity(
     FILE *stream, json_exclusivity_entry_t *list)
 {
-    fprintf(stream, ",\"attacker_move_exclusivity\":[");
+    fprintf(stream, "[");
     bool first_entry = true;
     while(list){
         char move_string[16];
@@ -614,16 +935,72 @@ static void json_print_exclusivity(
         if(!first_entry) fprintf(stream, ",");
         fprintf(stream,
                 "{\"ply\":%u,\"move\":\"%s\",\"status\":\"%s\""
+                ",\"comparison_scope\":\"%s\""
                 ",\"alternative_count\":%u"
+                ",\"selected_mate_moves\":%u"
+                ",\"comparison_search_plies\":%u"
+                ",\"has_unresolved_alternatives\":%s"
                 ",\"proven_mating_alternatives\":[",
                 list->ply, move_string,
                 json_exclusivity_status_string(list->status),
-                list->alternative_count);
+                list->same_piece_drop_scope
+                    ? "same_piece_drop_within_selected_length"
+                    : "all_checking_moves",
+                list->alternative_count,
+                list->selected_mate_moves,
+                list->comparison_search_plies,
+                list->has_unresolved_alternatives ? "true" : "false");
         bool first_alt = true;
         unsigned int shown = MIN(list->proven_mating_count,
                                   JSON_EXCLUSIVITY_MAX_ALT);
         for(unsigned int i=0; i<shown; i++){
             json_emit_move(stream, list->proven_mating[i], &first_alt);
+        }
+        fprintf(stream, "],\"proven_mating_alternative_details\":[");
+        first_alt = true;
+        for(unsigned int i=0; i<shown; i++){
+            char alternative_string[16];
+            move_to_sfen(alternative_string, list->proven_mating[i]);
+            if(!first_alt) fprintf(stream, ",");
+            fprintf(
+                stream,
+                "{\"move\":\"%s\",\"mate_moves\":%u,\"line\":[\"%s\"",
+                alternative_string,
+                list->proven_mating_moves[i],
+                alternative_string);
+            if(list->proven_mating_lines[i] &&
+               list->proven_mating_lines[i][0] != '\0')
+                fprintf(
+                    stream, ",%s",
+                    list->proven_mating_lines[i]);
+            fprintf(stream, "]}");
+            first_alt = false;
+        }
+        fprintf(stream, "],\"alternative_details\":[");
+        first_alt = true;
+        unsigned int alternative_shown = MIN(
+            list->alternative_count, JSON_EXCLUSIVITY_MAX_ALT);
+        for(unsigned int i=0; i<alternative_shown; i++){
+            char alternative_string[16];
+            move_to_sfen(alternative_string, list->alternatives[i]);
+            if(!first_alt) fprintf(stream, ",");
+            fprintf(
+                stream,
+                "{\"move\":\"%s\",\"status\":\"%s\""
+                ",\"proof_number\":%u,\"disproof_number\":%u"
+                ",\"search_depth\":%u}",
+                alternative_string,
+                list->alternative_results[i].pn == 0
+                    ? "mate"
+                    : list->alternative_results[i].dn == 0
+                    ? "no_mate"
+                    : list->alternative_bounded_out[i]
+                    ? "no_mate_within_selected_length"
+                    : "unresolved",
+                list->alternative_results[i].pn,
+                list->alternative_results[i].dn,
+                list->alternative_results[i].sh);
+            first_alt = false;
         }
         fprintf(stream, "]}");
         first_entry = false;
@@ -632,11 +1009,70 @@ static void json_print_exclusivity(
     fprintf(stream, "]");
 }
 
+bool tsume_json_defender_line_fprint(
+    FILE *stream, const sdata_t *sdata, tbase_t *tbase)
+{
+    bool first_move = true;
+    json_line_result_t result = json_emit_line_and(
+        stream, sdata, tbase, &first_move, false, false);
+    return result.complete && result.mate;
+}
+
+void tsume_json_defender_variations_fprint(
+    FILE *stream, const sdata_t *sdata, tbase_t *tbase)
+{
+    fprintf(stream, "[");
+    mvlist_t *list = json_prepare_and(sdata, tbase);
+    bool first_variation = true;
+    mvlist_t *candidate = list;
+    while(candidate){
+        if(candidate->tdata.pn){
+            sdata_t recovery;
+            tdata_t threshold = {
+                INFINATE-1, INFINATE-1, TSUME_MAX_DEPTH
+            };
+            memcpy(&recovery, sdata, sizeof(sdata_t));
+            sdata_move_forward(
+                &recovery, candidate->mlist->move);
+            bns_or(&recovery, &threshold, candidate, tbase);
+        }
+        if(!candidate->tdata.pn){
+            char defender_move[16];
+            move_to_sfen(
+                defender_move, candidate->mlist->move);
+            if(!first_variation) fprintf(stream, ",");
+            fprintf(
+                stream,
+                "{\"branch_ply\":%u,\"defender_move\":\"%s\""
+                ",\"line\":[\"%s\"",
+                S_COUNT(sdata)+1, defender_move, defender_move);
+            sdata_t child;
+            memcpy(&child, sdata, sizeof(sdata_t));
+            sdata_move_forward(
+                &child, candidate->mlist->move);
+            bool first_move = false;
+            json_line_result_t result = json_emit_line_or(
+                stream, &child, tbase, &first_move, false, false);
+            fprintf(
+                stream,
+                "],\"terminal_ply\":%u,\"complete\":%s}",
+                result.terminal_ply,
+                result.complete && result.mate ? "true" : "false");
+            first_variation = false;
+        }
+        candidate = candidate->next;
+    }
+    if(list) mvlist_free(list);
+    fprintf(stream, "]");
+}
+
 static json_line_result_t json_emit_line_or(
     FILE *stream, const sdata_t *sdata, tbase_t *tbase, bool *first_move,
     bool research_lines, bool analyze_exclusivity)
 {
-    json_line_result_t result = {true, false, S_COUNT(sdata), NULL, true};
+    json_line_result_t result = {
+        true, false, S_COUNT(sdata), 0, NULL, true
+    };
     if(S_COUNT(sdata) >= TSUME_MAX_DEPTH){
         result.complete = false;
         result.exclusivity_complete = false;
@@ -681,7 +1117,9 @@ static json_line_result_t json_emit_line_and(
     FILE *stream, const sdata_t *sdata, tbase_t *tbase, bool *first_move,
     bool research_lines, bool analyze_exclusivity)
 {
-    json_line_result_t result = {true, false, S_COUNT(sdata), NULL, true};
+    json_line_result_t result = {
+        true, false, S_COUNT(sdata), 0, NULL, true
+    };
     if(S_COUNT(sdata) >= TSUME_MAX_DEPTH){
         result.complete = false;
         result.exclusivity_complete = false;
@@ -691,6 +1129,7 @@ static json_line_result_t json_emit_line_and(
     mvlist_t *list = json_prepare_and(sdata, tbase);
     if(!list){
         result.mate = true;
+        result.attacker_hand_count = TOTAL_MKEY(ENEMY_MKEY(sdata));
         return result;
     }
     if(list->tdata.pn){
@@ -712,6 +1151,205 @@ static json_line_result_t json_emit_line_and(
     return result;
 }
 
+static json_line_result_t json_emit_optimal_or(
+        FILE *stream, const sdata_t *sdata, tbase_t *tbase, bool *first_move,
+        unsigned int remaining, bool analyze_exclusivity)
+    {
+        json_line_result_t failure = {
+            false, false, S_COUNT(sdata), 0, NULL, false
+        };
+        if(!remaining || S_COUNT(sdata) >= TSUME_MAX_DEPTH) return failure;
+
+        mvlist_t *list = json_prepare_or(sdata, tbase);
+        FILE *best_stream = NULL;
+        bool best_first = *first_move;
+        move_t best_move = {0};
+        json_line_result_t best = failure;
+        bool aborted = false;
+        mvlist_t *candidate = list;
+        while(candidate){
+            sdata_t child;
+            memcpy(&child, sdata, sizeof(sdata_t));
+            sdata_move_forward(&child, candidate->mlist->move);
+            if(json_exact_mate_and(&child, remaining - 1, tbase, &aborted)){
+                FILE *candidate_stream = tmpfile();
+                if(!candidate_stream){
+                    aborted = true;
+                    break;
+                }
+                bool candidate_first = *first_move;
+                json_emit_move(
+                    candidate_stream, candidate->mlist->move, &candidate_first);
+                json_line_result_t candidate_result = json_emit_optimal_and(
+                    candidate_stream, &child, tbase, &candidate_first,
+                    remaining - 1, false);
+                if(!candidate_result.complete || !candidate_result.mate){
+                    json_free_exclusivity(candidate_result.exclusivity);
+                    fclose(candidate_stream);
+                    aborted = true;
+                    break;
+                }
+                if(!best_stream ||
+                   candidate_result.attacker_hand_count >
+                       best.attacker_hand_count){
+                    if(best_stream) fclose(best_stream);
+                    json_free_exclusivity(best.exclusivity);
+                    best_stream = candidate_stream;
+                    best_first = candidate_first;
+                    best_move = candidate->mlist->move;
+                    best = candidate_result;
+                } else {
+                    json_free_exclusivity(candidate_result.exclusivity);
+                    fclose(candidate_stream);
+                }
+            }
+            if(aborted) break;
+            candidate = candidate->next;
+        }
+
+        if(aborted || !best_stream){
+            if(best_stream) fclose(best_stream);
+            json_free_exclusivity(best.exclusivity);
+            if(list) mvlist_free(list);
+            return failure;
+        }
+        if(analyze_exclusivity){
+            fclose(best_stream);
+            best_stream = tmpfile();
+            if(!best_stream){
+                json_free_exclusivity(best.exclusivity);
+                mvlist_free(list);
+                return failure;
+            }
+            best_first = *first_move;
+            json_emit_move(best_stream, best_move, &best_first);
+            sdata_t child;
+            memcpy(&child, sdata, sizeof(sdata_t));
+            sdata_move_forward(&child, best_move);
+            best = json_emit_optimal_and(
+                best_stream, &child, tbase, &best_first, remaining - 1, true);
+            if(!best.complete || !best.mate){
+                fclose(best_stream);
+                json_free_exclusivity(best.exclusivity);
+                mvlist_free(list);
+                return failure;
+            }
+        }
+        if(!json_copy_file(stream, best_stream)) best.complete = false;
+        fclose(best_stream);
+        *first_move = best_first;
+        if(analyze_exclusivity){
+            json_exclusivity_entry_t *entry = json_analyze_or_exclusivity(
+                sdata, tbase, list, best_move, S_COUNT(sdata)+1);
+            if(entry){
+                entry->next = best.exclusivity;
+                best.exclusivity = entry;
+            } else {
+                best.exclusivity_complete = false;
+            }
+        }
+        mvlist_free(list);
+        return best;
+    }
+
+    static json_line_result_t json_emit_optimal_and(
+        FILE *stream, const sdata_t *sdata, tbase_t *tbase, bool *first_move,
+        unsigned int remaining, bool analyze_exclusivity)
+    {
+        json_line_result_t failure = {
+            false, false, S_COUNT(sdata), 0, NULL, false
+        };
+        mvlist_t *list = json_prepare_and(sdata, tbase);
+        if(!list){
+            json_line_result_t mate = {
+                true, true, S_COUNT(sdata),
+                TOTAL_MKEY(ENEMY_MKEY(sdata)), NULL, true
+            };
+            return remaining == 0 ? mate : failure;
+        }
+        if(!remaining){
+            mvlist_free(list);
+            return failure;
+        }
+
+        FILE *best_stream = NULL;
+        bool best_first = *first_move;
+        move_t best_move = {0};
+        json_line_result_t best = failure;
+        bool aborted = false;
+        mvlist_t *candidate = list;
+        while(candidate){
+            sdata_t child;
+            memcpy(&child, sdata, sizeof(sdata_t));
+            sdata_move_forward(&child, candidate->mlist->move);
+            if(json_exact_mate_or(&child, remaining - 1, tbase, &aborted)){
+                FILE *candidate_stream = tmpfile();
+                if(!candidate_stream){
+                    aborted = true;
+                    break;
+                }
+                bool candidate_first = *first_move;
+                json_emit_move(
+                    candidate_stream, candidate->mlist->move, &candidate_first);
+                json_line_result_t candidate_result = json_emit_optimal_or(
+                    candidate_stream, &child, tbase, &candidate_first,
+                    remaining - 1, false);
+                if(!candidate_result.complete || !candidate_result.mate){
+                    json_free_exclusivity(candidate_result.exclusivity);
+                    fclose(candidate_stream);
+                    aborted = true;
+                    break;
+                }
+                if(!best_stream ||
+                   candidate_result.attacker_hand_count <
+                       best.attacker_hand_count){
+                    if(best_stream) fclose(best_stream);
+                    json_free_exclusivity(best.exclusivity);
+                    best_stream = candidate_stream;
+                    best_first = candidate_first;
+                    best_move = candidate->mlist->move;
+                    best = candidate_result;
+                } else {
+                    json_free_exclusivity(candidate_result.exclusivity);
+                    fclose(candidate_stream);
+                }
+            }
+            if(aborted) break;
+            candidate = candidate->next;
+        }
+
+        mvlist_free(list);
+        if(aborted || !best_stream){
+            if(best_stream) fclose(best_stream);
+            json_free_exclusivity(best.exclusivity);
+            return failure;
+        }
+        if(analyze_exclusivity){
+            fclose(best_stream);
+            best_stream = tmpfile();
+            if(!best_stream){
+                json_free_exclusivity(best.exclusivity);
+                return failure;
+            }
+            best_first = *first_move;
+            json_emit_move(best_stream, best_move, &best_first);
+            sdata_t child;
+            memcpy(&child, sdata, sizeof(sdata_t));
+            sdata_move_forward(&child, best_move);
+            best = json_emit_optimal_or(
+                best_stream, &child, tbase, &best_first, remaining - 1, true);
+            if(!best.complete || !best.mate){
+                fclose(best_stream);
+                json_free_exclusivity(best.exclusivity);
+                return failure;
+            }
+        }
+        if(!json_copy_file(stream, best_stream)) best.complete = false;
+        fclose(best_stream);
+        *first_move = best_first;
+        return best;
+}
+
 static json_baseline_line_t* json_capture_baseline(
     unsigned int branch_ply, move_t defender_move,
     const sdata_t *branch, tbase_t *tbase, bool analyze_exclusivity)
@@ -722,7 +1360,7 @@ static json_baseline_line_t* json_capture_baseline(
     baseline->defender_move = defender_move;
     baseline->stream = tmpfile();
     baseline->result = (json_line_result_t){
-        false, false, branch_ply, NULL, false
+        false, false, branch_ply, 0, NULL, false
     };
     baseline->first_move = false;
     baseline->next = st_json_baselines;
@@ -782,14 +1420,32 @@ static json_line_result_t json_emit_researched_line_or(
     }
 
     bool research_first = *first_move;
-    json_line_result_t researched = json_emit_line_or(
-        research_stream, sdata, tbase, &research_first, true,
-        analyze_exclusivity);
+    unsigned int upper = TSUME_MAX_DEPTH - S_COUNT(sdata);
+    unsigned int shortest = 0;
+    bool aborted = false;
+    for(unsigned int depth = 1; depth <= upper; depth += 2){
+        json_bounded_mate_status_t bounded =
+            json_bounded_mate_or(sdata, depth, tbase);
+        if(bounded == JSON_BOUNDED_ABORTED){
+            aborted = true;
+            break;
+        }
+        if(bounded == JSON_BOUNDED_MATE){
+            shortest = depth;
+            break;
+        }
+    }
+    json_line_result_t researched = {
+        false, false, S_COUNT(sdata), 0, NULL, false
+    };
+    if(!aborted && shortest){
+        researched = json_emit_optimal_or(
+            research_stream, sdata, tbase, &research_first, shortest,
+            analyze_exclusivity);
+    }
 
     bool choose_research =
-        researched.complete && researched.mate &&
-        (!baseline->result.complete || !baseline->result.mate ||
-         researched.terminal_ply <= baseline->result.terminal_ply);
+        researched.complete && researched.mate;
     FILE *selected_stream =
         choose_research ? research_stream : baseline->stream;
     json_line_result_t result =
@@ -850,6 +1506,14 @@ static bool json_collect_variations_or(
     bool complete = json_collect_variations_and(
         stream, &sbuf, tbase, first_variation, principal, principal_length,
         research_lines, analyze_exclusivity, principal_valid);
+    if(analyze_exclusivity){
+        json_exclusivity_entry_t *entry = json_analyze_or_exclusivity(
+            sdata, tbase, list, selected->mlist->move, S_COUNT(sdata)+1);
+        if(entry){
+            entry->next = st_json_principal_exclusivity;
+            st_json_principal_exclusivity = entry;
+        }
+    }
     mvlist_free(list);
     return complete;
 }
@@ -923,9 +1587,11 @@ static bool json_collect_variations_and(
             alternative->tdata.pn == 0,
             false,
             S_COUNT(sdata)+1,
+            0,
             NULL,
             false
         };
+        bool used_research = false;
         /* exclusivityの所有権:
          *  true  -> このresult.exclusivityはこの繰り返しでのみ有効。
          *           出力後にjson_free_exclusivityで解放する。
@@ -936,7 +1602,6 @@ static bool json_collect_variations_and(
             sdata_t branch;
             memcpy(&branch, sdata, sizeof(sdata_t));
             sdata_move_forward(&branch, alternative->mlist->move);
-            bool used_research = false;
             if(st_json_capture_baselines){
                 json_baseline_line_t *baseline = json_capture_baseline(
                     S_COUNT(sdata)+1, alternative->mlist->move,
@@ -953,15 +1618,18 @@ static bool json_collect_variations_and(
                         analyze_exclusivity);
                 }
             } else if(research_lines){
+                json_baseline_line_t *baseline = json_find_baseline(
+                    S_COUNT(sdata)+1, alternative->mlist->move);
                 result = json_emit_researched_line_or(
                     stream, &branch, tbase, &first_move,
-                    json_find_baseline(
-                        S_COUNT(sdata)+1, alternative->mlist->move),
+                    baseline,
                     &used_research, analyze_exclusivity);
                 /* 採用されたのが再探索側(used_research)であれば所有権は
                  * このスコープにある。baseline側が採用された場合は
-                 * baseline構造体が所有権を保持し続ける。 */
-                owns_exclusivity = used_research;
+                 * baseline構造体が所有権を保持し続ける。baseline自体が
+                 * 無い場合の通常線もこのスコープが所有する。 */
+                owns_exclusivity =
+                    used_research || !baseline || !baseline->stream;
             } else {
                 result = json_emit_line_or(
                     stream, &branch, tbase, &first_move, false,
@@ -973,17 +1641,21 @@ static bool json_collect_variations_and(
             }
             fprintf(stream, ",\"line_search\":\"%s\"",
                     used_research
-                        ? "bounded_attacker_candidates"
+                        ? "exact_attacker_minimax"
                         : "proof_tree_order");
         } else {
             fprintf(stream, "]");
             fprintf(stream, ",\"line_search\":\"proof_tree_order\"");
         }
-        fprintf(stream, ",\"line_optimality\":\"unverified\"");
+        fprintf(stream, ",\"line_optimality\":\"%s\"",
+                used_research
+                    ? "proven_shortest_surplus_tiebreak"
+                    : "unverified");
         fprintf(stream, ",\"complete\":%s", result.complete ? "true" : "false");
         if(analyze_exclusivity){
             fprintf(stream, ",\"attacker_move_exclusivity_complete\":%s",
                     result.exclusivity_complete ? "true" : "false");
+            fprintf(stream, ",\"attacker_move_exclusivity\":");
             json_print_exclusivity(stream, result.exclusivity);
             if(owns_exclusivity) json_free_exclusivity(result.exclusivity);
         }

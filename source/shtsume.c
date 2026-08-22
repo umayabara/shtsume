@@ -93,7 +93,7 @@ void print_help                (void)
      " 注）k,gオプションでの出力先はホームディレクトリ（Mac）またはインストール先(Win)\n"
      " d,display: 詰み発見時、探索後に手順確認モードへ移行します。\n"
      " J,json   : 検索結果を JSON で 1 行出力します。\n"
-     " O,research-lines: JSON変化の攻方候補を現行線の手数上限内で再探索します。\n"
+     " O,research-lines: JSON変化を攻方最短・同手数なら駒余り優先で再探索します。\n"
      " x,analyze-exclusivity: JSON変化の各手順について、選択された攻方着手が\n"
      "                        唯一の詰み筋かどうかを追加探索して判定します。\n"
      " y,yomi   : 探索中、読み筋表示。\n"
@@ -265,6 +265,37 @@ void bn_search                  (const sdata_t   *sdata,
     }
     
     return;
+}
+
+void bn_search_defender         (const sdata_t   *sdata,
+                                  tdata_t         *tdata,
+                                  tbase_t         *tbase)
+{
+    memset(&g_tsearchinf, 0, sizeof(tsearchinf_t));
+    g_gc_max_level = 0;
+    g_gc_num = 0;
+    g_suspend = false;
+    g_stop_received = false;
+    g_prev_nodes = 0;
+    g_prev_update = g_info_interval;
+    st_max_thpn = 0;
+    st_max_thdn = 0;
+    st_max_tsh = 0;
+    st_max_dsh = 0;
+    st_max_depth = 0;
+    g_redundant = false;
+    g_error = false;
+    g_loop = -1;
+    g_root_max = 1;
+
+    mvlist_t mvlist;
+    memset(&mvlist, 0, sizeof(mvlist_t));
+    memcpy(&(mvlist.tdata), &g_tdata_init, sizeof(tdata_t));
+    tdata_t threshold = {PROOF_MAX-1, INFINATE-1, TSUME_MAX_DEPTH};
+    st_symmetry = symmetry_check(sdata);
+    st_start = clock();
+    bn_search_and(sdata, &threshold, &mvlist, tbase);
+    memcpy(tdata, &(mvlist.tdata), sizeof(tdata_t));
 }
 
 void bns_or                     (const sdata_t   *sdata,

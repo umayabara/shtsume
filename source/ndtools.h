@@ -87,6 +87,12 @@ bool tsume_json_variations_fprint(FILE           *stream,
                                   bool             research_lines,
                                   bool             analyze_exclusivity,
                                   bool            *principal_valid);
+bool tsume_json_defender_line_fprint(FILE         *stream,
+                                     const sdata_t *sdata,
+                                     tbase_t       *tbase);
+void tsume_json_defender_variations_fprint(FILE         *stream,
+                                           const sdata_t *sdata,
+                                           tbase_t       *tbase);
         
 //初手から局面ごとに表示
 void tsume_debug                (const sdata_t   *sdata,

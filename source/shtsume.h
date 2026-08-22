@@ -463,6 +463,9 @@ uint16_t disproof_number (mvlist_t  *mvlist, uint16_t *dcnt);
 void bn_search                  (const sdata_t   *sdata,
                                  tdata_t         *tdata,
                                  tbase_t         *tbase);
+void bn_search_defender         (const sdata_t   *sdata,
+                                 tdata_t         *tdata,
+                                 tbase_t         *tbase);
 void bns_or                     (const sdata_t   *sdata,
                                  tdata_t      *th_tdata,
                                  mvlist_t       *mvlist,

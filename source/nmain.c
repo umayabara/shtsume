@@ -31,6 +31,7 @@ static bool st_display;
 static bool st_json;
 static bool st_research_lines;
 static bool st_analyze_exclusivity;
+static bool st_defender_root;
 static char *st_principal_string;
 static const struct option longopts[] =
 {
@@ -44,6 +45,7 @@ static const struct option longopts[] =
      {"json",    no_argument,        NULL,   'J'},  //st_json
      {"research-lines", no_argument, NULL,   'O'},  //st_research_lines
      {"analyze-exclusivity", no_argument, NULL, 'x'}, //st_analyze_exclusivity
+     {"defender-root", no_argument, NULL, 'D'},  //st_defender_root
      {"principal", required_argument, NULL,  'P'},  //st_principal_string
      {"yomi",    no_argument,        NULL,   'y'},  //g_disp_search
      {"all",     no_argument,        NULL,   'a'},  //g_smode
@@ -67,7 +69,7 @@ int main(int argc, char * const argv[]) {
     int optc;
     g_info_interval = 5;
     g_pv_length     = PV_LENGTH_DEFAULT;
-    while((optc = getopt_long(argc, argv, "hvkgdJyOaxP:n:m:l:i:j:t:",
+    while((optc = getopt_long(argc, argv, "hvkgdJyOaxDP:n:m:l:i:j:t:",
                               longopts, NULL))!= -1)
         switch(optc){
             case 'h':
@@ -85,6 +87,7 @@ int main(int argc, char * const argv[]) {
             case 'J': st_json = true;       break;
             case 'O': st_research_lines = true; break;
             case 'x': st_analyze_exclusivity = true; break;
+            case 'D': st_defender_root = true; break;
             case 'P': st_principal_string = optarg; break;
             case 'y': g_disp_search = true; break;
             case 'a': g_smode = (TP_NONE|TP_ALLMOVE); break;
@@ -267,7 +270,10 @@ int main(int argc, char * const argv[]) {
         clock_t start = clock();
         tdata_t tdata;
         
-        bn_search(&g_sdata, &tdata, g_tbase);
+        if(st_defender_root)
+            bn_search_defender(&g_sdata, &tdata, g_tbase);
+        else
+            bn_search(&g_sdata, &tdata, g_tbase);
         
         clock_t finish = clock();
         
@@ -280,14 +286,19 @@ int main(int argc, char * const argv[]) {
             else               status = "unknown";
             printf("{");
             printf("\"status\":\"%s\"", status);
+            printf(",\"root_node\":\"%s\"",
+                   st_defender_root ? "defender" : "attacker");
             printf(",\"redundant\":%s", g_redundant ? "true" : "false");
             printf(",\"futile_interposition_pruning\":\"builtin\"");
             printf(",\"variation_collection\":\"single_proof_tree\"");
             printf(",\"variation_line_search\":\"%s\"",
                    st_research_lines
-                       ? "bounded_attacker_candidates"
+                       ? "exact_attacker_minimax"
                        : "proof_tree_order");
-            printf(",\"variation_line_optimality\":\"unverified\"");
+            printf(",\"variation_line_optimality\":\"%s\"",
+                   st_research_lines
+                       ? "per_variation"
+                       : "unverified");
             if(st_analyze_exclusivity){
                 printf(",\"attacker_move_exclusivity_analysis\":true");
             }
@@ -307,21 +318,26 @@ int main(int argc, char * const argv[]) {
             printf(",\"tree_nodes\":%llu", g_tbase->pr_num);
             printf(",\"table_entries\":%llu", g_tbase->num);
             printf(",\"principal_variation\":[");
-            unsigned int output_principal_length =
-                requested_principal_length ? requested_principal_length
-                                           : TSUME_MAX_DEPTH;
-            for(unsigned int i=0; i<output_principal_length; i++){
-                move_t mv = requested_principal_length
-                    ? requested_principal[i]
-                    : g_tsearchinf.mvinf[i].move;
-                if(mv.prev_pos == 0 && mv.new_pos == 0) break;
-                if(MV_TORYO(mv)) break;
-                if(num++) printf(",");
-                move_to_sfen(mvstr, mv);
-                printf("\"%s\"", mvstr);
+            if(st_defender_root && !tdata.pn){
+                tsume_json_defender_line_fprint(
+                    stdout, &g_sdata, g_tbase);
+            } else {
+                unsigned int output_principal_length =
+                    requested_principal_length ? requested_principal_length
+                                               : TSUME_MAX_DEPTH;
+                for(unsigned int i=0; i<output_principal_length; i++){
+                    move_t mv = requested_principal_length
+                        ? requested_principal[i]
+                        : g_tsearchinf.mvinf[i].move;
+                    if(mv.prev_pos == 0 && mv.new_pos == 0) break;
+                    if(MV_TORYO(mv)) break;
+                    if(num++) printf(",");
+                    move_to_sfen(mvstr, mv);
+                    printf("\"%s\"", mvstr);
+                }
             }
             printf("]");
-            if(!tdata.pn){
+            if(!tdata.pn && !st_defender_root){
                 printf(",\"variations\":");
                 bool principal_valid;
                 bool variations_complete =
@@ -335,6 +351,12 @@ int main(int argc, char * const argv[]) {
                        principal_valid ? "true" : "false");
                 printf(",\"variations_complete\":%s",
                        variations_complete ? "true" : "false");
+            } else if(!tdata.pn){
+                printf(",\"variations\":");
+                tsume_json_defender_variations_fprint(
+                    stdout, &g_sdata, g_tbase);
+                printf(",\"principal_variation_valid\":true");
+                printf(",\"variations_complete\":true");
             }
             printf("}\n");
         } else if(!tdata.pn){
