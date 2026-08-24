@@ -94,6 +94,21 @@ typedef enum {
  */
 #define JSON_EXCLUSIVITY_PROOF_PN_LIMIT 16
 
+/* 代案の不詰反証線は、循環しない異常な木でも有限時間で打ち切る。 */
+#define JSON_NO_MATE_LINE_MAX_PLIES 256
+
+typedef struct {
+    bool complete;
+    const char *terminal_reason;
+} json_no_mate_line_result_t;
+
+typedef struct {
+    zkey_t zkey;
+    mkey_t sente_hand;
+    mkey_t gote_hand;
+    turn_t turn;
+} json_position_key_t;
+
 typedef struct json_exclusivity_entry {
     unsigned int ply;                 /* 攻方着手の手数(1始まり)        */
     move_t       move;                /* 実際に選択された着手           */
@@ -106,6 +121,9 @@ typedef struct json_exclusivity_entry {
     move_t       alternatives[JSON_EXCLUSIVITY_MAX_ALT];
     tdata_t      alternative_results[JSON_EXCLUSIVITY_MAX_ALT];
     bool         alternative_bounded_out[JSON_EXCLUSIVITY_MAX_ALT];
+    char        *alternative_refutation_lines[JSON_EXCLUSIVITY_MAX_ALT];
+    bool         alternative_refutation_complete[JSON_EXCLUSIVITY_MAX_ALT];
+    const char  *alternative_refutation_reasons[JSON_EXCLUSIVITY_MAX_ALT];
     move_t       proven_mating[JSON_EXCLUSIVITY_MAX_ALT];
     unsigned int proven_mating_moves[JSON_EXCLUSIVITY_MAX_ALT];
     char        *proven_mating_lines[JSON_EXCLUSIVITY_MAX_ALT];
@@ -166,6 +184,9 @@ static bool json_collect_variations_and(
     bool research_lines, bool analyze_exclusivity, bool *principal_valid);
 static void json_emit_move(
     FILE *stream, move_t move, bool *first_move);
+static char* json_read_stream(FILE *stream);
+static json_no_mate_line_result_t json_emit_no_mate_line(
+    FILE *stream, const sdata_t *sdata, tbase_t *tbase);
 static mvlist_t* json_select_move(mvlist_t *list, move_t move);
 static void json_free_baselines(json_baseline_line_t *list);
 static json_exclusivity_entry_t* json_analyze_or_exclusivity(
@@ -620,6 +641,105 @@ static bool json_copy_file(FILE *destination, FILE *source)
     return !ferror(source);
 }
 
+static char* json_read_stream(FILE *stream)
+{
+    if(fflush(stream) != 0 || fseek(stream, 0, SEEK_END) != 0) return NULL;
+    long length = ftell(stream);
+    if(length < 0 || fseek(stream, 0, SEEK_SET) != 0) return NULL;
+    char *text = malloc((size_t)length + 1);
+    if(!text) return NULL;
+    size_t read_length = fread(text, 1, (size_t)length, stream);
+    if(read_length != (size_t)length && ferror(stream)){
+        free(text);
+        return NULL;
+    }
+    text[read_length] = '\0';
+    return text;
+}
+
+static bool json_position_seen(
+    const sdata_t *sdata, const json_position_key_t *positions,
+    unsigned int count)
+{
+    for(unsigned int i=0; i<count; i++){
+        if(positions[i].zkey == S_ZKEY(sdata) &&
+           positions[i].turn == S_TURN(sdata) &&
+           !memcmp(&positions[i].sente_hand, &S_SMKEY(sdata),
+                   sizeof(mkey_t)) &&
+           !memcmp(&positions[i].gote_hand, &S_GMKEY(sdata),
+                   sizeof(mkey_t)))
+            return true;
+    }
+    return false;
+}
+
+/*
+ * 固定済みの代案王手を指した直後(AND節点)から、不詰の反証木を一本たどる。
+ * AND節点では dn==0 の受方逃れを、OR節点では dn==0 の代表王手を選ぶ。
+ */
+static json_no_mate_line_result_t json_emit_no_mate_line(
+    FILE *stream, const sdata_t *sdata, tbase_t *tbase)
+{
+    json_no_mate_line_result_t result = {
+        false, "disproof_tree_incomplete"
+    };
+    json_position_key_t positions[JSON_NO_MATE_LINE_MAX_PLIES + 1];
+    unsigned int position_count = 0;
+    unsigned int emitted = 0;
+    bool defender_node = true;
+    bool first_move = true;
+    sdata_t current;
+    memcpy(&current, sdata, sizeof(sdata_t));
+
+    while(true){
+        if(json_position_seen(&current, positions, position_count)){
+            result.complete = true;
+            result.terminal_reason = "repetition";
+            return result;
+        }
+        positions[position_count++] = (json_position_key_t){
+            S_ZKEY(&current), S_SMKEY(&current), S_GMKEY(&current),
+            S_TURN(&current)
+        };
+        if(emitted >= JSON_NO_MATE_LINE_MAX_PLIES ||
+           S_COUNT(&current) >= TSUME_MAX_DEPTH){
+            result.terminal_reason = "maximum_depth_reached";
+            return result;
+        }
+        if(g_suspend || g_stop_received){
+            result.terminal_reason = "search_aborted";
+            return result;
+        }
+
+        mvlist_t *list = defender_node
+            ? json_prepare_and(&current, tbase)
+            : json_prepare_or(&current, tbase);
+        if(!list){
+            if(!defender_node){
+                result.complete = true;
+                result.terminal_reason = "no_legal_checking_move";
+            } else {
+                result.terminal_reason = "unexpected_no_evasion";
+            }
+            return result;
+        }
+
+        mvlist_t *selected = list;
+        while(selected && selected->tdata.dn != 0)
+            selected = selected->next;
+        if(!selected){
+            mvlist_free(list);
+            return result;
+        }
+
+        json_emit_move(stream, selected->mlist->move, &first_move);
+        sdata_move_forward(&current, selected->mlist->move);
+        emitted++;
+        defender_node = !defender_node;
+        mvlist_free(list);
+    }
+}
+
 static mvlist_t* json_select_move(mvlist_t *list, move_t move)
 {
     mvlist_t *selected = list;
@@ -671,8 +791,12 @@ static json_exclusivity_entry_t* json_analyze_or_exclusivity(
     entry->comparison_search_plies = 0;
     entry->has_unresolved_alternatives = false;
     entry->proven_mating_count = 0;
-    for(unsigned int i=0; i<JSON_EXCLUSIVITY_MAX_ALT; i++)
+    for(unsigned int i=0; i<JSON_EXCLUSIVITY_MAX_ALT; i++){
         entry->alternative_bounded_out[i] = false;
+        entry->alternative_refutation_lines[i] = NULL;
+        entry->alternative_refutation_complete[i] = false;
+        entry->alternative_refutation_reasons[i] = NULL;
+    }
     for(unsigned int i=0; i<JSON_EXCLUSIVITY_MAX_ALT; i++)
         entry->proven_mating_lines[i] = NULL;
     entry->next = NULL;
@@ -774,9 +898,9 @@ static json_exclusivity_entry_t* json_analyze_or_exclusivity(
                     bns_and_isolated(
                         &child, &proof_threshold, &probe,
                         st_json_exclusivity_tbase);
+                    candidate_tbase = st_json_exclusivity_tbase;
                     if(probe.tdata.pn == 0){
                         candidate_result = probe.tdata;
-                        candidate_tbase = st_json_exclusivity_tbase;
                     } else {
                         candidate_result =
                             (tdata_t){probe.tdata.pn,
@@ -885,7 +1009,32 @@ static json_exclusivity_entry_t* json_analyze_or_exclusivity(
                 /* pn!=0 かつ dn!=0: 追加探索でも未解決のまま */
                 any_unresolved = true;
             }
-            /* dn==0 の場合は不詰と証明済みのため、何もしない */
+            if(candidate_result.dn == 0 &&
+               alternative_index < JSON_EXCLUSIVITY_MAX_ALT){
+                FILE *refutation_stream = tmpfile();
+                if(refutation_stream){
+                    json_no_mate_line_result_t refutation =
+                        json_emit_no_mate_line(
+                            refutation_stream, &child, candidate_tbase);
+                    entry->alternative_refutation_lines[alternative_index] =
+                        json_read_stream(refutation_stream);
+                    entry->alternative_refutation_complete[alternative_index] =
+                        refutation.complete;
+                    entry->alternative_refutation_reasons[alternative_index] =
+                        refutation.terminal_reason;
+                    if(!entry->alternative_refutation_lines[
+                           alternative_index]){
+                        entry->alternative_refutation_complete[
+                            alternative_index] = false;
+                        entry->alternative_refutation_reasons[
+                            alternative_index] = "output_unavailable";
+                    }
+                    fclose(refutation_stream);
+                } else {
+                    entry->alternative_refutation_reasons[
+                        alternative_index] = "output_unavailable";
+                }
+            }
         }
         candidate = candidate->next;
     }
@@ -908,6 +1057,8 @@ static void json_free_exclusivity(json_exclusivity_entry_t *list)
             JSON_EXCLUSIVITY_MAX_ALT);
         for(unsigned int i=0; i<shown; i++)
             free(list->proven_mating_lines[i]);
+        for(unsigned int i=0; i<JSON_EXCLUSIVITY_MAX_ALT; i++)
+            free(list->alternative_refutation_lines[i]);
         free(list);
         list = next;
     }
@@ -988,7 +1139,7 @@ static void json_print_exclusivity(
                 stream,
                 "{\"move\":\"%s\",\"status\":\"%s\""
                 ",\"proof_number\":%u,\"disproof_number\":%u"
-                ",\"search_depth\":%u}",
+                ",\"search_depth\":%u",
                 alternative_string,
                 list->alternative_results[i].pn == 0
                     ? "mate"
@@ -1000,6 +1151,23 @@ static void json_print_exclusivity(
                 list->alternative_results[i].pn,
                 list->alternative_results[i].dn,
                 list->alternative_results[i].sh);
+            if(list->alternative_results[i].dn == 0){
+                fprintf(stream, ",\"refutation_line\":[");
+                if(list->alternative_refutation_lines[i] &&
+                   list->alternative_refutation_lines[i][0] != '\0')
+                    fprintf(stream, "%s",
+                            list->alternative_refutation_lines[i]);
+                fprintf(
+                    stream,
+                    "],\"refutation_line_complete\":%s"
+                    ",\"refutation_terminal_reason\":\"%s\"",
+                    list->alternative_refutation_complete[i]
+                        ? "true" : "false",
+                    list->alternative_refutation_reasons[i]
+                        ? list->alternative_refutation_reasons[i]
+                        : "output_unavailable");
+            }
+            fprintf(stream, "}");
             first_alt = false;
         }
         fprintf(stream, "]}");
