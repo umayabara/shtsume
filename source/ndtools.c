@@ -109,6 +109,21 @@ typedef struct {
     turn_t turn;
 } json_position_key_t;
 
+/*
+ * 線駒打ちの手数では comparison_scope が限定打の比較に切り替わり、
+ * alternative_details が同駒種・同半直線の打だけになる。紛れの候補には
+ * それ以外の王手も要るので、限定打の判定はそのままに、全王手を対象にした
+ * 解析を general_alternatives へ別に持つ。
+ */
+typedef struct {
+    move_t       move;
+    tdata_t      result;
+    bool         horizon_out;
+    char        *refutation_line;
+    bool         refutation_complete;
+    const char  *refutation_reason;
+} json_general_alternative_t;
+
 typedef struct json_exclusivity_entry {
     unsigned int ply;                 /* 攻方着手の手数(1始まり)        */
     move_t       move;                /* 実際に選択された着手           */
@@ -130,6 +145,9 @@ typedef struct json_exclusivity_entry {
     unsigned int proven_mating_moves[JSON_EXCLUSIVITY_MAX_ALT];
     char        *proven_mating_lines[JSON_EXCLUSIVITY_MAX_ALT];
     unsigned int proven_mating_count; /* 詰みと証明された他候補の数     */
+    json_general_alternative_t
+                 general_alternatives[JSON_EXCLUSIVITY_MAX_ALT];
+    unsigned int general_count;       /* 限定打の手数での全王手の解析数  */
     struct json_exclusivity_entry *next;
 } json_exclusivity_entry_t;
 
@@ -833,6 +851,99 @@ static json_no_mate_line_result_t json_emit_no_mate_line(
     }
 }
 
+/*
+ * 王手候補1手を、全王手を対象にした基準で解析する。
+ * 未解決ならDFPNで追加探索し、それでも決まらなければ有界不詰を試す。
+ * 不詰が付いた候補には代表反証線を添える。
+ * 限定打の比較(alternative_details)には手を入れない。
+ */
+static void json_analyze_general_alternative(
+    const sdata_t *sdata, mvlist_t *candidate, tdata_t threshold,
+    tbase_t *tbase, json_general_alternative_t *out)
+{
+    out->move = candidate->mlist->move;
+    out->result = candidate->tdata;
+    out->horizon_out = false;
+    out->refutation_line = NULL;
+    out->refutation_complete = false;
+    out->refutation_reason = NULL;
+
+    sdata_t child;
+    memcpy(&child, sdata, sizeof(sdata_t));
+    sdata_move_forward(&child, out->move);
+    tbase_t *candidate_tbase = tbase;
+
+    if(out->result.pn != 0 && out->result.dn != 0 &&
+       st_json_exclusivity_tbase){
+        initialize_tbase(st_json_exclusivity_tbase);
+        mvlist_t probe = *candidate;
+        probe.next = NULL;
+        probe.tdata = (tdata_t){1, 1, 0};
+        probe.hinc = 0;
+        probe.inc = 0;
+        probe.nouse = 0;
+        probe.nouse2 = 0;
+        bns_and_isolated(
+            &child, &threshold, &probe, st_json_exclusivity_tbase);
+        out->result = probe.tdata;
+        candidate_tbase = st_json_exclusivity_tbase;
+        if(st_json_bounded_plies > 1 &&
+           out->result.pn != 0 && out->result.dn != 0){
+            initialize_tbase(st_json_exclusivity_tbase);
+            move_t witness_move;
+            bool witness_found = false;
+            if(st_json_bounded_seconds > 0.0 &&
+               !st_json_bounded_deadline_set){
+                st_json_bounded_deadline = clock() + (clock_t)
+                    (st_json_bounded_seconds * CLOCKS_PER_SEC);
+                st_json_bounded_deadline_set = true;
+            }
+            st_json_bounded_nodes = 0;
+            st_json_bounded_active = true;
+            json_bounded_mate_status_t bounded_result =
+                json_bounded_no_mate_witness(
+                    &child, st_json_bounded_plies - 1,
+                    st_json_exclusivity_tbase,
+                    &witness_move, &witness_found);
+            st_json_bounded_active = false;
+            if(bounded_result == JSON_BOUNDED_NO_MATE){
+                out->horizon_out = true;
+                if(witness_found){
+                    char witness_string[16];
+                    move_to_sfen(witness_string, witness_move);
+                    char *line = malloc(strlen(witness_string)+3);
+                    if(line){
+                        sprintf(line, "\"%s\"", witness_string);
+                        out->refutation_line = line;
+                        out->refutation_reason =
+                            "bounded_no_mate_witness";
+                    }
+                }
+            }
+        }
+    }
+
+    if(out->result.dn == 0){
+        FILE *refutation_stream = tmpfile();
+        if(refutation_stream){
+            json_no_mate_line_result_t refutation =
+                json_emit_no_mate_line(
+                    refutation_stream, &child, candidate_tbase);
+            out->refutation_line = json_read_stream(refutation_stream);
+            out->refutation_complete = refutation.complete;
+            out->refutation_reason = refutation.terminal_reason;
+            if(!out->refutation_line){
+                out->refutation_complete = false;
+                out->refutation_reason = "output_unavailable";
+            }
+            fclose(refutation_stream);
+        } else {
+            out->refutation_reason = "output_unavailable";
+        }
+    }
+    return;
+}
+
 static mvlist_t* json_select_move(mvlist_t *list, move_t move)
 {
     mvlist_t *selected = list;
@@ -884,6 +995,9 @@ static json_exclusivity_entry_t* json_analyze_or_exclusivity(
     entry->comparison_search_plies = 0;
     entry->has_unresolved_alternatives = false;
     entry->proven_mating_count = 0;
+    entry->general_count = 0;
+    memset(entry->general_alternatives, 0,
+           sizeof(entry->general_alternatives));
     for(unsigned int i=0; i<JSON_EXCLUSIVITY_MAX_ALT; i++){
         entry->alternative_bounded_out[i] = false;
         entry->alternative_horizon_out[i] = false;
@@ -1184,6 +1298,30 @@ static json_exclusivity_entry_t* json_analyze_or_exclusivity(
         }
         candidate = candidate->next;
     }
+    /*
+     * 限定打の比較に切り替わった手数では、上のループが同駒種の打しか見ていない。
+     * 紛れの候補には残りの王手も要るので、全王手を対象にした解析を別に行う。
+     * status と alternative_details は限定打の判定のまま触らない。
+     */
+    if(same_piece_drop_scope){
+        unsigned int general_depth =
+            list->tdata.sh + JSON_EXCLUSIVITY_DEPTH_MARGIN;
+        if(general_depth > TSUME_MAX_DEPTH ||
+           general_depth < list->tdata.sh)
+            general_depth = TSUME_MAX_DEPTH;
+        tdata_t general_threshold = {
+            INFINATE-1, INFINATE-1, general_depth
+        };
+        for(mvlist_t *node = list; node; node = node->next){
+            if(node->mlist->move.prev_pos == selected_move.prev_pos &&
+               node->mlist->move.new_pos  == selected_move.new_pos)
+                continue;
+            if(entry->general_count >= JSON_EXCLUSIVITY_MAX_ALT) break;
+            json_analyze_general_alternative(
+                sdata, node, general_threshold, tbase,
+                &entry->general_alternatives[entry->general_count++]);
+        }
+    }
     if(entry->proven_mating_count > 0)
         entry->status = JSON_EXCLUSIVITY_NONEXCLUSIVE;
     else if(any_unresolved)
@@ -1205,6 +1343,8 @@ static void json_free_exclusivity(json_exclusivity_entry_t *list)
             free(list->proven_mating_lines[i]);
         for(unsigned int i=0; i<JSON_EXCLUSIVITY_MAX_ALT; i++)
             free(list->alternative_refutation_lines[i]);
+        for(unsigned int i=0; i<JSON_EXCLUSIVITY_MAX_ALT; i++)
+            free(list->general_alternatives[i].refutation_line);
         free(list);
         list = next;
     }
@@ -1319,7 +1459,57 @@ static void json_print_exclusivity(
             fprintf(stream, "}");
             first_alt = false;
         }
-        fprintf(stream, "]}");
+        fprintf(stream, "]");
+        if(list->general_count){
+            fprintf(stream, ",\"general_alternative_details\":[");
+            first_alt = true;
+            unsigned int general_shown = MIN(
+                list->general_count, JSON_EXCLUSIVITY_MAX_ALT);
+            for(unsigned int i=0; i<general_shown; i++){
+                json_general_alternative_t *alternative =
+                    &list->general_alternatives[i];
+                char alternative_string[16];
+                move_to_sfen(alternative_string, alternative->move);
+                if(!first_alt) fprintf(stream, ",");
+                fprintf(
+                    stream,
+                    "{\"move\":\"%s\",\"status\":\"%s\""
+                    ",\"proof_number\":%u,\"disproof_number\":%u"
+                    ",\"search_depth\":%u",
+                    alternative_string,
+                    alternative->result.pn == 0
+                        ? "mate"
+                        : alternative->result.dn == 0
+                        ? "no_mate"
+                        : alternative->horizon_out
+                        ? "no_mate_within_horizon"
+                        : "unresolved",
+                    alternative->result.pn,
+                    alternative->result.dn,
+                    alternative->result.sh);
+                if(alternative->result.dn == 0 ||
+                   alternative->refutation_line){
+                    fprintf(stream, ",\"refutation_line\":[");
+                    if(alternative->refutation_line &&
+                       alternative->refutation_line[0] != '\0')
+                        fprintf(stream, "%s",
+                                alternative->refutation_line);
+                    fprintf(
+                        stream,
+                        "],\"refutation_line_complete\":%s"
+                        ",\"refutation_terminal_reason\":\"%s\"",
+                        alternative->refutation_complete
+                            ? "true" : "false",
+                        alternative->refutation_reason
+                            ? alternative->refutation_reason
+                            : "output_unavailable");
+                }
+                fprintf(stream, "}");
+                first_alt = false;
+            }
+            fprintf(stream, "]");
+        }
+        fprintf(stream, "}");
         first_entry = false;
         list = list->next;
     }
