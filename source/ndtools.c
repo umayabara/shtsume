@@ -121,6 +121,8 @@ typedef struct json_exclusivity_entry {
     move_t       alternatives[JSON_EXCLUSIVITY_MAX_ALT];
     tdata_t      alternative_results[JSON_EXCLUSIVITY_MAX_ALT];
     bool         alternative_bounded_out[JSON_EXCLUSIVITY_MAX_ALT];
+    /* 初手からの固定手数(探索地平)内に詰みが無いと確認できた候補 */
+    bool         alternative_horizon_out[JSON_EXCLUSIVITY_MAX_ALT];
     char        *alternative_refutation_lines[JSON_EXCLUSIVITY_MAX_ALT];
     bool         alternative_refutation_complete[JSON_EXCLUSIVITY_MAX_ALT];
     const char  *alternative_refutation_reasons[JSON_EXCLUSIVITY_MAX_ALT];
@@ -151,7 +153,21 @@ typedef struct json_baseline_line {
 
 static json_baseline_line_t *st_json_baselines;
 static bool st_json_capture_baselines;
-static bool st_json_bounded_no_mate;
+/* 各分岐から数えた有界不詰探索の手数。0 なら判定しない。 */
+static unsigned int st_json_bounded_plies;
+/*
+ * 有界不詰探索の上限。手数を伸ばすと探索量が急に増えるため、上限に達したら
+ * 打ち切って、その候補は unresolved のまま残す。
+ *   node_budget  : ノード数の上限(0で無制限)。再現性が要るときに使う
+ *   deadline     : 1回の解析全体に許す時間の締め切り
+ * どちらも限定打側の固定深さ探索には適用しない(そちらは既に校正済みのため)。
+ */
+static uint64_t st_json_bounded_node_budget;
+static uint64_t st_json_bounded_nodes;
+static double   st_json_bounded_seconds;
+static clock_t  st_json_bounded_deadline;
+static bool     st_json_bounded_deadline_set;
+static bool     st_json_bounded_active;
 static tbase_t *st_json_exclusivity_tbase;
 static json_exclusivity_entry_t *st_json_principal_exclusivity;
 
@@ -398,9 +414,15 @@ int tsume_fprint                (FILE            *stream,
     return num;
 }
 
-void tsume_json_set_bounded_no_mate(bool enabled)
+void tsume_json_set_bounded_no_mate(unsigned int branch_plies,
+                                    uint64_t     node_budget,
+                                    double       seconds)
 {
-    st_json_bounded_no_mate = enabled;
+    st_json_bounded_plies = branch_plies;
+    st_json_bounded_node_budget = node_budget;
+    st_json_bounded_seconds = seconds;
+    st_json_bounded_deadline_set = false;
+    st_json_bounded_active = false;
     return;
 }
 
@@ -527,10 +549,31 @@ static mvlist_t* json_prepare_and(const sdata_t *sdata, tbase_t *tbase)
     return sdata_mvlist_sort(list, sdata, disproof_number_comp);
 }
 
+/*
+ * 有界探索の打ち切り判定。clock()を毎ノード読むと高くつくので、
+ * ノード数を数えて一定間隔でだけ時計を見る。
+ */
+#define JSON_BOUNDED_CLOCK_INTERVAL 4096
+
+static bool json_bounded_budget_exhausted(void)
+{
+    if(!st_json_bounded_active) return false;
+    st_json_bounded_nodes++;
+    if(st_json_bounded_node_budget &&
+       st_json_bounded_nodes > st_json_bounded_node_budget)
+        return true;
+    if(st_json_bounded_deadline_set &&
+       !(st_json_bounded_nodes % JSON_BOUNDED_CLOCK_INTERVAL) &&
+       clock() > st_json_bounded_deadline)
+        return true;
+    return false;
+}
+
 static json_bounded_mate_status_t json_bounded_mate_or(
     const sdata_t *sdata, unsigned int remaining, tbase_t *tbase)
 {
     if(g_suspend || g_stop_received) return JSON_BOUNDED_ABORTED;
+    if(json_bounded_budget_exhausted()) return JSON_BOUNDED_ABORTED;
     if(remaining == 0) return JSON_BOUNDED_NO_MATE;
 
     mvlist_t *list = generate_check(sdata, tbase);
@@ -556,6 +599,7 @@ static json_bounded_mate_status_t json_bounded_mate_and(
     const sdata_t *sdata, unsigned int remaining, tbase_t *tbase)
 {
     if(g_suspend || g_stop_received) return JSON_BOUNDED_ABORTED;
+    if(json_bounded_budget_exhausted()) return JSON_BOUNDED_ABORTED;
 
     /*
      * generate_evasion が同一の無駄合系列を mlist->next にまとめる。
@@ -597,6 +641,7 @@ static json_bounded_mate_status_t json_bounded_no_mate_witness(
 {
     *witness_found = false;
     if(g_suspend || g_stop_received) return JSON_BOUNDED_ABORTED;
+    if(json_bounded_budget_exhausted()) return JSON_BOUNDED_ABORTED;
 
     mvlist_t *list = generate_evasion(sdata, tbase);
     if(!list) return JSON_BOUNDED_MATE;
@@ -841,6 +886,7 @@ static json_exclusivity_entry_t* json_analyze_or_exclusivity(
     entry->proven_mating_count = 0;
     for(unsigned int i=0; i<JSON_EXCLUSIVITY_MAX_ALT; i++){
         entry->alternative_bounded_out[i] = false;
+        entry->alternative_horizon_out[i] = false;
         entry->alternative_refutation_lines[i] = NULL;
         entry->alternative_refutation_complete[i] = false;
         entry->alternative_refutation_reasons[i] = NULL;
@@ -979,22 +1025,33 @@ static json_exclusivity_entry_t* json_analyze_or_exclusivity(
                 candidate_tbase = st_json_exclusivity_tbase;
                 /*
                  * DFPNでも未解決のまま残った代案は、完全な不詰証明の
-                 * 代わりに「選択手順と同じ手数以内には詰まない」ことを
+                 * 代わりに「初手から数えて指定手数以内には詰まない」ことを
                  * 固定深さの全探索で確かめる。全分岐の消尽を要する完全
                  * 反証と違い、深さが有限なので必ず停止する。
+                 * 手数は分岐からの相対で数える。選択手順の詰み手数と揃える
+                 * 意味は無く、紛れは「その手を指してから読者が読む範囲で
+                 * 詰まないか」が問題であるため。
                  */
-                if(st_json_bounded_no_mate &&
+                if(st_json_bounded_plies > 1 &&
                    candidate_result.pn != 0 &&
-                   candidate_result.dn != 0 &&
-                   entry->selected_mate_moves > 0){
+                   candidate_result.dn != 0){
                     initialize_tbase(st_json_exclusivity_tbase);
                     move_t witness_move;
                     bool witness_found = false;
+                    if(st_json_bounded_seconds > 0.0 &&
+                       !st_json_bounded_deadline_set){
+                        st_json_bounded_deadline = clock() + (clock_t)
+                            (st_json_bounded_seconds * CLOCKS_PER_SEC);
+                        st_json_bounded_deadline_set = true;
+                    }
+                    st_json_bounded_nodes = 0;
+                    st_json_bounded_active = true;
                     json_bounded_mate_status_t bounded_result =
                         json_bounded_no_mate_witness(
-                            &child, entry->selected_mate_moves - 1,
+                            &child, st_json_bounded_plies - 1,
                             st_json_exclusivity_tbase,
                             &witness_move, &witness_found);
+                    st_json_bounded_active = false;
                     if(bounded_result == JSON_BOUNDED_NO_MATE){
                         bounded_no_mate = true;
                         if(witness_found &&
@@ -1022,7 +1079,9 @@ static json_exclusivity_entry_t* json_analyze_or_exclusivity(
                 entry->alternative_results[alternative_index] =
                     candidate_result;
                 entry->alternative_bounded_out[alternative_index] =
-                    bounded_out || bounded_no_mate;
+                    bounded_out;
+                entry->alternative_horizon_out[alternative_index] =
+                    bounded_no_mate;
             }
             if(candidate_result.pn == 0){
                 bool mating_line_complete = bounded_mate;
@@ -1234,6 +1293,8 @@ static void json_print_exclusivity(
                     ? "no_mate"
                     : list->alternative_bounded_out[i]
                     ? "no_mate_within_selected_length"
+                    : list->alternative_horizon_out[i]
+                    ? "no_mate_within_horizon"
                     : "unresolved",
                 list->alternative_results[i].pn,
                 list->alternative_results[i].dn,

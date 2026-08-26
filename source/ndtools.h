@@ -88,12 +88,16 @@ bool tsume_json_variations_fprint(FILE           *stream,
                                   bool             analyze_exclusivity,
                                   bool            *principal_valid);
 /*
- * 有効にすると、all_checking_moves の代案のうちDFPN追加探索でも未解決だった
- * ものについて、選択手順と同じ手数以内に詰みが無いことを固定深さの全探索で
- * 確認する。確認できた代案の status は no_mate_within_selected_length と
- * なる。完全な不詰証明(dn==0)とは別の、有界な証拠である。
+ * branch_plies に 2 以上を渡すと、all_checking_moves の代案のうちDFPN追加探索でも
+ * 未解決だったものについて、その代案を指してから branch_plies 手以内に詰みが
+ * 無いことを固定深さの全探索で確認する。確認できた代案の status は
+ * no_mate_within_horizon となる。完全な不詰証明(dn==0)とは別の、有界な証拠である。
+ * node_budget は1候補あたりの探索ノード上限(0で無制限)、seconds は1回の解析全体に
+ * 許す秒数(0で無制限)。上限に達した候補は unresolved のまま残す。
  */
-void tsume_json_set_bounded_no_mate(bool             enabled);
+void tsume_json_set_bounded_no_mate(unsigned int     branch_plies,
+                                    uint64_t         node_budget,
+                                    double           seconds);
 
 bool tsume_json_defender_line_fprint(FILE         *stream,
                                      const sdata_t *sdata,

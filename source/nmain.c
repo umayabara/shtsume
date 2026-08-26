@@ -27,11 +27,17 @@ bool        g_json_output;
  スタティック変数
  -------------- */
 
+/* 有界不詰探索の上限の既定値。ノードは無制限、時間は解析全体で300秒。 */
+#define BOUNDED_NO_MATE_NODES_DEFAULT   0ULL
+#define BOUNDED_NO_MATE_SECONDS_DEFAULT 300.0
+
 static bool st_display;
 static bool st_json;
 static bool st_research_lines;
 static bool st_analyze_exclusivity;
-static bool st_bounded_no_mate;
+static unsigned int st_bounded_plies;
+static uint64_t st_bounded_nodes = BOUNDED_NO_MATE_NODES_DEFAULT;
+static double st_bounded_seconds = BOUNDED_NO_MATE_SECONDS_DEFAULT;
 static bool st_defender_root;
 static char *st_principal_string;
 static const struct option longopts[] =
@@ -46,7 +52,11 @@ static const struct option longopts[] =
      {"json",    no_argument,        NULL,   'J'},  //st_json
      {"research-lines", no_argument, NULL,   'O'},  //st_research_lines
      {"analyze-exclusivity", no_argument, NULL, 'x'}, //st_analyze_exclusivity
-     {"bounded-no-mate", no_argument, NULL, 'B'},  //st_bounded_no_mate
+     {"bounded-no-mate", required_argument, NULL, 'B'},//st_bounded_horizon
+     {"bounded-no-mate-nodes", required_argument, NULL, 'N'},
+                                                      //st_bounded_nodes
+     {"bounded-no-mate-seconds", required_argument, NULL, 'S'},
+                                                      //st_bounded_seconds
      {"defender-root", no_argument, NULL, 'D'},  //st_defender_root
      {"principal", required_argument, NULL,  'P'},  //st_principal_string
      {"yomi",    no_argument,        NULL,   'y'},  //g_disp_search
@@ -71,7 +81,8 @@ int main(int argc, char * const argv[]) {
     int optc;
     g_info_interval = 5;
     g_pv_length     = PV_LENGTH_DEFAULT;
-    while((optc = getopt_long(argc, argv, "hvkgdJyOaxBDP:n:m:l:i:j:t:",
+    while((optc = getopt_long(argc, argv,
+                              "hvkgdJyOaxDB:N:S:P:n:m:l:i:j:t:",
                               longopts, NULL))!= -1)
         switch(optc){
             case 'h':
@@ -89,7 +100,23 @@ int main(int argc, char * const argv[]) {
             case 'J': st_json = true;       break;
             case 'O': st_research_lines = true; break;
             case 'x': st_analyze_exclusivity = true; break;
-            case 'B': st_bounded_no_mate = true; break;
+            case 'B': {
+                int plies = atoi(optarg);
+                st_bounded_plies = plies > 0
+                    ? (unsigned int)MIN(plies, TSUME_MAX_DEPTH)
+                    : 0;
+                break;
+            }
+            case 'N': {
+                long long nodes = atoll(optarg);
+                st_bounded_nodes = nodes > 0 ? (uint64_t)nodes : 0;
+                break;
+            }
+            case 'S': {
+                double seconds = atof(optarg);
+                st_bounded_seconds = seconds > 0.0 ? seconds : 0.0;
+                break;
+            }
             case 'D': st_defender_root = true; break;
             case 'P': st_principal_string = optarg; break;
             case 'y': g_disp_search = true; break;
@@ -240,7 +267,9 @@ int main(int argc, char * const argv[]) {
         g_tbase = create_tbase(size);
         g_mtt = create_mtt(MTT_SIZE);
         if(!g_time_limit) g_time_limit = TM_INFINATE;
-        tsume_json_set_bounded_no_mate(st_bounded_no_mate);
+        tsume_json_set_bounded_no_mate(st_bounded_plies,
+                                       st_bounded_nodes,
+                                       st_bounded_seconds);
 
         if(!st_json){
             //探索条件の表示
@@ -306,7 +335,13 @@ int main(int argc, char * const argv[]) {
             if(st_analyze_exclusivity){
                 printf(",\"attacker_move_exclusivity_analysis\":true");
                 printf(",\"bounded_no_mate_analysis\":%s",
-                       st_bounded_no_mate ? "true" : "false");
+                       st_bounded_plies > 1 ? "true" : "false");
+                printf(",\"bounded_no_mate_plies\":%u",
+                       st_bounded_plies);
+                printf(",\"bounded_no_mate_node_budget\":%llu",
+                       st_bounded_nodes);
+                printf(",\"bounded_no_mate_seconds\":%.1f",
+                       st_bounded_seconds);
             }
             printf(",\"search_config\":{\"memory_mb\":%llu"
                    ",\"min_proof_number\":%u,\"level\":%u}",
