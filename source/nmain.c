@@ -31,6 +31,7 @@ static bool st_display;
 static bool st_json;
 static bool st_research_lines;
 static bool st_analyze_exclusivity;
+static bool st_bounded_no_mate;
 static bool st_defender_root;
 static char *st_principal_string;
 static const struct option longopts[] =
@@ -45,6 +46,7 @@ static const struct option longopts[] =
      {"json",    no_argument,        NULL,   'J'},  //st_json
      {"research-lines", no_argument, NULL,   'O'},  //st_research_lines
      {"analyze-exclusivity", no_argument, NULL, 'x'}, //st_analyze_exclusivity
+     {"bounded-no-mate", no_argument, NULL, 'B'},  //st_bounded_no_mate
      {"defender-root", no_argument, NULL, 'D'},  //st_defender_root
      {"principal", required_argument, NULL,  'P'},  //st_principal_string
      {"yomi",    no_argument,        NULL,   'y'},  //g_disp_search
@@ -69,7 +71,7 @@ int main(int argc, char * const argv[]) {
     int optc;
     g_info_interval = 5;
     g_pv_length     = PV_LENGTH_DEFAULT;
-    while((optc = getopt_long(argc, argv, "hvkgdJyOaxDP:n:m:l:i:j:t:",
+    while((optc = getopt_long(argc, argv, "hvkgdJyOaxBDP:n:m:l:i:j:t:",
                               longopts, NULL))!= -1)
         switch(optc){
             case 'h':
@@ -87,6 +89,7 @@ int main(int argc, char * const argv[]) {
             case 'J': st_json = true;       break;
             case 'O': st_research_lines = true; break;
             case 'x': st_analyze_exclusivity = true; break;
+            case 'B': st_bounded_no_mate = true; break;
             case 'D': st_defender_root = true; break;
             case 'P': st_principal_string = optarg; break;
             case 'y': g_disp_search = true; break;
@@ -237,6 +240,7 @@ int main(int argc, char * const argv[]) {
         g_tbase = create_tbase(size);
         g_mtt = create_mtt(MTT_SIZE);
         if(!g_time_limit) g_time_limit = TM_INFINATE;
+        tsume_json_set_bounded_no_mate(st_bounded_no_mate);
 
         if(!st_json){
             //探索条件の表示
@@ -301,6 +305,8 @@ int main(int argc, char * const argv[]) {
                        : "unverified");
             if(st_analyze_exclusivity){
                 printf(",\"attacker_move_exclusivity_analysis\":true");
+                printf(",\"bounded_no_mate_analysis\":%s",
+                       st_bounded_no_mate ? "true" : "false");
             }
             printf(",\"search_config\":{\"memory_mb\":%llu"
                    ",\"min_proof_number\":%u,\"level\":%u}",

@@ -44,10 +44,17 @@ void tsearchinf_update          (const sdata_t *sdata,
                                  clock_t        start,
                                  char          *str  )
 {
-    g_tsearchinf.elapsed = clock() - start;      //micro sec
+    g_tsearchinf.elapsed = clock() - start;      //clock単位(CLOCKS_PER_SEC)
     //時間切れの処理
+    /*
+     * g_time_limitはミリ秒(USIのgo mate、コマンドラインの-iとも)。
+     * clock()の単位は環境依存で、macOSはCLOCKS_PER_SEC=1,000,000、
+     * Windows(MinGW)は1,000。定数1000での換算はmacOSでしか成立しないため、
+     * CLOCKS_PER_SECでミリ秒からclock単位へ換算する。
+     */
     if(g_time_limit>=0
-       && g_tsearchinf.elapsed>g_time_limit*1000)
+       && (double)g_tsearchinf.elapsed
+          > (double)g_time_limit*CLOCKS_PER_SEC/1000.0)
     {
         g_suspend = true;
         return;

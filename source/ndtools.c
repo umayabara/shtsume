@@ -151,6 +151,7 @@ typedef struct json_baseline_line {
 
 static json_baseline_line_t *st_json_baselines;
 static bool st_json_capture_baselines;
+static bool st_json_bounded_no_mate;
 static tbase_t *st_json_exclusivity_tbase;
 static json_exclusivity_entry_t *st_json_principal_exclusivity;
 
@@ -397,6 +398,12 @@ int tsume_fprint                (FILE            *stream,
     return num;
 }
 
+void tsume_json_set_bounded_no_mate(bool enabled)
+{
+    st_json_bounded_no_mate = enabled;
+    return;
+}
+
 bool tsume_json_variations_fprint(
     FILE *stream, const sdata_t *sdata, tbase_t *tbase,
     const move_t *principal, unsigned int principal_length,
@@ -571,6 +578,47 @@ static json_bounded_mate_status_t json_bounded_mate_and(
             json_bounded_mate_or(&child, remaining - 1, tbase);
         if(child_result != JSON_BOUNDED_MATE){
             result = child_result;
+            break;
+        }
+        evasion = evasion->next;
+    }
+    mvlist_free(list);
+    return result;
+}
+
+/*
+ * 有界不詰の証拠として、詰みを免れる受方の応手を1手だけ取り出す。
+ * 固定深さ内で詰まないことを示す代表手であり、完全な逃れ手順ではない。
+ * 一意性(他の応手でも逃れられるか)はここでは判定しない。
+ */
+static json_bounded_mate_status_t json_bounded_no_mate_witness(
+    const sdata_t *sdata, unsigned int remaining, tbase_t *tbase,
+    move_t *witness, bool *witness_found)
+{
+    *witness_found = false;
+    if(g_suspend || g_stop_received) return JSON_BOUNDED_ABORTED;
+
+    mvlist_t *list = generate_evasion(sdata, tbase);
+    if(!list) return JSON_BOUNDED_MATE;
+    if(remaining == 0){
+        mvlist_free(list);
+        return JSON_BOUNDED_NO_MATE;
+    }
+
+    mvlist_t *evasion = list;
+    json_bounded_mate_status_t result = JSON_BOUNDED_MATE;
+    while(evasion){
+        sdata_t child;
+        memcpy(&child, sdata, sizeof(sdata_t));
+        sdata_move_forward(&child, evasion->mlist->move);
+        json_bounded_mate_status_t child_result =
+            json_bounded_mate_or(&child, remaining - 1, tbase);
+        if(child_result != JSON_BOUNDED_MATE){
+            result = child_result;
+            if(child_result == JSON_BOUNDED_NO_MATE){
+                *witness = evasion->mlist->move;
+                *witness_found = true;
+            }
             break;
         }
         evasion = evasion->next;
@@ -869,6 +917,7 @@ static json_exclusivity_entry_t* json_analyze_or_exclusivity(
             sdata_move_forward(&child, candidate->mlist->move);
             bool bounded_out = false;
             bool bounded_mate = false;
+            bool bounded_no_mate = false;
             if(same_piece_drop_scope && st_json_exclusivity_tbase &&
                selected_bound_found){
                 initialize_tbase(st_json_exclusivity_tbase);
@@ -928,6 +977,44 @@ static json_exclusivity_entry_t* json_analyze_or_exclusivity(
                     st_json_exclusivity_tbase);
                 candidate_result = probe.tdata;
                 candidate_tbase = st_json_exclusivity_tbase;
+                /*
+                 * DFPNでも未解決のまま残った代案は、完全な不詰証明の
+                 * 代わりに「選択手順と同じ手数以内には詰まない」ことを
+                 * 固定深さの全探索で確かめる。全分岐の消尽を要する完全
+                 * 反証と違い、深さが有限なので必ず停止する。
+                 */
+                if(st_json_bounded_no_mate &&
+                   candidate_result.pn != 0 &&
+                   candidate_result.dn != 0 &&
+                   entry->selected_mate_moves > 0){
+                    initialize_tbase(st_json_exclusivity_tbase);
+                    move_t witness_move;
+                    bool witness_found = false;
+                    json_bounded_mate_status_t bounded_result =
+                        json_bounded_no_mate_witness(
+                            &child, entry->selected_mate_moves - 1,
+                            st_json_exclusivity_tbase,
+                            &witness_move, &witness_found);
+                    if(bounded_result == JSON_BOUNDED_NO_MATE){
+                        bounded_no_mate = true;
+                        if(witness_found &&
+                           alternative_index < JSON_EXCLUSIVITY_MAX_ALT){
+                            char witness_string[16];
+                            move_to_sfen(witness_string, witness_move);
+                            char *line = malloc(strlen(witness_string)+3);
+                            if(line){
+                                sprintf(line, "\"%s\"", witness_string);
+                                entry->alternative_refutation_lines[
+                                    alternative_index] = line;
+                                entry->alternative_refutation_complete[
+                                    alternative_index] = false;
+                                entry->alternative_refutation_reasons[
+                                    alternative_index] =
+                                    "bounded_no_mate_witness";
+                            }
+                        }
+                    }
+                }
             }
             if(alternative_index < JSON_EXCLUSIVITY_MAX_ALT){
                 entry->alternatives[alternative_index] =
@@ -935,7 +1022,7 @@ static json_exclusivity_entry_t* json_analyze_or_exclusivity(
                 entry->alternative_results[alternative_index] =
                     candidate_result;
                 entry->alternative_bounded_out[alternative_index] =
-                    bounded_out;
+                    bounded_out || bounded_no_mate;
             }
             if(candidate_result.pn == 0){
                 bool mating_line_complete = bounded_mate;
@@ -1151,7 +1238,8 @@ static void json_print_exclusivity(
                 list->alternative_results[i].pn,
                 list->alternative_results[i].dn,
                 list->alternative_results[i].sh);
-            if(list->alternative_results[i].dn == 0){
+            if(list->alternative_results[i].dn == 0 ||
+               list->alternative_refutation_lines[i]){
                 fprintf(stream, ",\"refutation_line\":[");
                 if(list->alternative_refutation_lines[i] &&
                    list->alternative_refutation_lines[i][0] != '\0')
