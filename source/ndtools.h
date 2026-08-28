@@ -94,10 +94,14 @@ bool tsume_json_variations_fprint(FILE           *stream,
  * no_mate_within_horizon となる。完全な不詰証明(dn==0)とは別の、有界な証拠である。
  * node_budget は1候補あたりの探索ノード上限(0で無制限)、seconds は1回の解析全体に
  * 許す秒数(0で無制限)。上限に達した候補は unresolved のまま残す。
+ * escape_uniqueness を立てると、不詰と分かった代案について、指定手数以内の詰みを
+ * 免れる受方の応手が何通りあるかを数え escape_move_count として報告する。
+ * 全受けを試すので探索量が増える。
  */
 void tsume_json_set_bounded_no_mate(unsigned int     branch_plies,
                                     uint64_t         node_budget,
-                                    double           seconds);
+                                    double           seconds,
+                                    bool             escape_uniqueness);
 
 bool tsume_json_defender_line_fprint(FILE         *stream,
                                      const sdata_t *sdata,

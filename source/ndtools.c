@@ -115,6 +115,16 @@ typedef struct {
  * それ以外の王手も要るので、限定打の判定はそのままに、全王手を対象にした
  * 解析を general_alternatives へ別に持つ。
  */
+/* 逃れ手はJSONに何手まで書き出すか。数そのものは escape_count が持つ。 */
+#define JSON_ESCAPE_MOVES_MAX 4
+
+typedef struct {
+    unsigned int count;                    /* 逃れ手の数            */
+    unsigned int listed;                   /* うち書き出した数       */
+    move_t       moves[JSON_ESCAPE_MOVES_MAX];
+    bool         counted;                  /* 数えたか(打ち切りなら偽) */
+} json_escape_t;
+
 typedef struct {
     move_t       move;
     tdata_t      result;
@@ -122,6 +132,7 @@ typedef struct {
     char        *refutation_line;
     bool         refutation_complete;
     const char  *refutation_reason;
+    json_escape_t escape;
 } json_general_alternative_t;
 
 typedef struct json_exclusivity_entry {
@@ -141,6 +152,7 @@ typedef struct json_exclusivity_entry {
     char        *alternative_refutation_lines[JSON_EXCLUSIVITY_MAX_ALT];
     bool         alternative_refutation_complete[JSON_EXCLUSIVITY_MAX_ALT];
     const char  *alternative_refutation_reasons[JSON_EXCLUSIVITY_MAX_ALT];
+    json_escape_t alternative_escapes[JSON_EXCLUSIVITY_MAX_ALT];
     move_t       proven_mating[JSON_EXCLUSIVITY_MAX_ALT];
     unsigned int proven_mating_moves[JSON_EXCLUSIVITY_MAX_ALT];
     char        *proven_mating_lines[JSON_EXCLUSIVITY_MAX_ALT];
@@ -186,6 +198,8 @@ static double   st_json_bounded_seconds;
 static clock_t  st_json_bounded_deadline;
 static bool     st_json_bounded_deadline_set;
 static bool     st_json_bounded_active;
+/* 逃れ手の一意性を数えるか。全受けを試すので既定では行わない。 */
+static bool     st_json_escape_uniqueness;
 static tbase_t *st_json_exclusivity_tbase;
 static json_exclusivity_entry_t *st_json_principal_exclusivity;
 
@@ -197,6 +211,10 @@ static json_bounded_mate_status_t json_bounded_mate_or(
     const sdata_t *sdata, unsigned int remaining, tbase_t *tbase);
 static json_bounded_mate_status_t json_bounded_mate_and(
     const sdata_t *sdata, unsigned int remaining, tbase_t *tbase);
+static unsigned int json_bounded_escape_count(
+    const sdata_t *sdata, unsigned int remaining, tbase_t *tbase,
+    move_t *moves, unsigned int max_moves, unsigned int *listed,
+    bool *aborted);
 static json_line_result_t json_emit_line_or(
     FILE *stream, const sdata_t *sdata, tbase_t *tbase, bool *first_move,
     bool research_lines, bool analyze_exclusivity);
@@ -434,13 +452,51 @@ int tsume_fprint                (FILE            *stream,
 
 void tsume_json_set_bounded_no_mate(unsigned int branch_plies,
                                     uint64_t     node_budget,
-                                    double       seconds)
+                                    double       seconds,
+                                    bool         escape_uniqueness)
 {
     st_json_bounded_plies = branch_plies;
     st_json_bounded_node_budget = node_budget;
     st_json_bounded_seconds = seconds;
+    st_json_escape_uniqueness = escape_uniqueness;
     st_json_bounded_deadline_set = false;
     st_json_bounded_active = false;
+    return;
+}
+
+/*
+ * 不詰と分かった代案について、逃れ手が何通りあるかを数える。
+ * 打ち切り(時間・ノード上限)に当たったら counted を偽のままにする。
+ */
+static void json_count_escapes(
+    const sdata_t *child, tbase_t *tbase, json_escape_t *escape)
+{
+    if(!st_json_escape_uniqueness || st_json_bounded_plies <= 1) return;
+    if(!st_json_exclusivity_tbase) return;
+    initialize_tbase(st_json_exclusivity_tbase);
+    if(st_json_bounded_seconds > 0.0 && !st_json_bounded_deadline_set){
+        st_json_bounded_deadline = clock() + (clock_t)
+            (st_json_bounded_seconds * CLOCKS_PER_SEC);
+        st_json_bounded_deadline_set = true;
+    }
+    st_json_bounded_nodes = 0;
+    st_json_bounded_active = true;
+    bool aborted = false;
+    unsigned int count = json_bounded_escape_count(
+        child, st_json_bounded_plies - 1, st_json_exclusivity_tbase,
+        escape->moves, JSON_ESCAPE_MOVES_MAX, &escape->listed, &aborted);
+    st_json_bounded_active = false;
+    /*
+     * 不詰と判定した代案なのに逃れ手が0通りになるのは矛盾する。
+     * 固定深さの全探索は禁じ手(打歩詰)を詰みとして数えている疑いがあるため、
+     * 数を報告しない(Q-019)。
+     */
+    if(aborted || !count){
+        escape->listed = 0;
+        return;
+    }
+    escape->count = count;
+    escape->counted = true;
     return;
 }
 
@@ -646,6 +702,54 @@ static json_bounded_mate_status_t json_bounded_mate_and(
     }
     mvlist_free(list);
     return result;
+}
+
+/*
+ * 逃れ手の一意性を数える。受方の合法手を全て試し、指定手数以内の詰みを
+ * 免れるものが何通りあるかを返す。1通りなら「その手しか逃れがない」で、
+ * 解説の価値が高い（D-008の4指標のうち逃れ手の一意性）。
+ *
+ * generate_evasion が無駄合系列をまとめるので、無駄合は別々の逃れ手として
+ * 数えない。打ち切られた場合は aborted を立て、数を信用しない。
+ */
+static unsigned int json_bounded_escape_count(
+    const sdata_t *sdata, unsigned int remaining, tbase_t *tbase,
+    move_t *moves, unsigned int max_moves, unsigned int *listed,
+    bool *aborted)
+{
+    *listed = 0;
+    *aborted = false;
+    if(!remaining){
+        *aborted = true;
+        return 0;
+    }
+    mvlist_t *list = generate_evasion(sdata, tbase);
+    if(!list){
+        /*
+         * 受方に手が無い＝詰み。不詰と判定した代案でこれが起きるのは
+         * 矛盾なので、数を報告せず打ち切り扱いにする（Q-019）。
+         */
+        *aborted = true;
+        return 0;
+    }
+
+    unsigned int count = 0;
+    for(mvlist_t *evasion = list; evasion; evasion = evasion->next){
+        sdata_t child;
+        memcpy(&child, sdata, sizeof(sdata_t));
+        sdata_move_forward(&child, evasion->mlist->move);
+        json_bounded_mate_status_t child_result =
+            json_bounded_mate_or(&child, remaining - 1, tbase);
+        if(child_result == JSON_BOUNDED_ABORTED){
+            *aborted = true;
+            break;
+        }
+        if(child_result == JSON_BOUNDED_MATE) continue;
+        count++;
+        if(*listed < max_moves) moves[(*listed)++] = evasion->mlist->move;
+    }
+    mvlist_free(list);
+    return count;
 }
 
 /*
@@ -867,6 +971,7 @@ static void json_analyze_general_alternative(
     out->refutation_line = NULL;
     out->refutation_complete = false;
     out->refutation_reason = NULL;
+    memset(&out->escape, 0, sizeof(out->escape));
 
     sdata_t child;
     memcpy(&child, sdata, sizeof(sdata_t));
@@ -941,6 +1046,8 @@ static void json_analyze_general_alternative(
             out->refutation_reason = "output_unavailable";
         }
     }
+    if(out->result.dn == 0 || out->horizon_out)
+        json_count_escapes(&child, tbase, &out->escape);
     return;
 }
 
@@ -998,6 +1105,8 @@ static json_exclusivity_entry_t* json_analyze_or_exclusivity(
     entry->general_count = 0;
     memset(entry->general_alternatives, 0,
            sizeof(entry->general_alternatives));
+    memset(entry->alternative_escapes, 0,
+           sizeof(entry->alternative_escapes));
     for(unsigned int i=0; i<JSON_EXCLUSIVITY_MAX_ALT; i++){
         entry->alternative_bounded_out[i] = false;
         entry->alternative_horizon_out[i] = false;
@@ -1295,6 +1404,12 @@ static json_exclusivity_entry_t* json_analyze_or_exclusivity(
                         alternative_index] = "output_unavailable";
                 }
             }
+            if((candidate_result.dn == 0 || bounded_no_mate) &&
+               alternative_index < JSON_EXCLUSIVITY_MAX_ALT){
+                json_count_escapes(
+                    &child, candidate_tbase,
+                    &entry->alternative_escapes[alternative_index]);
+            }
         }
         candidate = candidate->next;
     }
@@ -1359,6 +1474,19 @@ static const char* json_exclusivity_status_string(
         case JSON_EXCLUSIVITY_EXCLUSIVE:
         default:                            return "exclusive";
     }
+}
+
+static void json_print_escape(FILE *stream, const json_escape_t *escape)
+{
+    if(!escape->counted) return;
+    fprintf(stream, ",\"escape_move_count\":%u,\"escape_moves\":[",
+            escape->count);
+    bool first = true;
+    for(unsigned int i=0; i<escape->listed; i++){
+        json_emit_move(stream, escape->moves[i], &first);
+    }
+    fprintf(stream, "]");
+    return;
 }
 
 static void json_print_exclusivity(
@@ -1456,6 +1584,7 @@ static void json_print_exclusivity(
                         ? list->alternative_refutation_reasons[i]
                         : "output_unavailable");
             }
+            json_print_escape(stream, &list->alternative_escapes[i]);
             fprintf(stream, "}");
             first_alt = false;
         }
@@ -1504,6 +1633,7 @@ static void json_print_exclusivity(
                             ? alternative->refutation_reason
                             : "output_unavailable");
                 }
+                json_print_escape(stream, &alternative->escape);
                 fprintf(stream, "}");
                 first_alt = false;
             }

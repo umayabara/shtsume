@@ -38,6 +38,7 @@ static bool st_analyze_exclusivity;
 static unsigned int st_bounded_plies;
 static uint64_t st_bounded_nodes = BOUNDED_NO_MATE_NODES_DEFAULT;
 static double st_bounded_seconds = BOUNDED_NO_MATE_SECONDS_DEFAULT;
+static bool st_escape_uniqueness;
 static bool st_defender_root;
 static char *st_principal_string;
 static const struct option longopts[] =
@@ -57,6 +58,7 @@ static const struct option longopts[] =
                                                       //st_bounded_nodes
      {"bounded-no-mate-seconds", required_argument, NULL, 'S'},
                                                       //st_bounded_seconds
+     {"escape-uniqueness", no_argument, NULL, 'U'},  //st_escape_uniqueness
      {"defender-root", no_argument, NULL, 'D'},  //st_defender_root
      {"principal", required_argument, NULL,  'P'},  //st_principal_string
      {"yomi",    no_argument,        NULL,   'y'},  //g_disp_search
@@ -82,7 +84,7 @@ int main(int argc, char * const argv[]) {
     g_info_interval = 5;
     g_pv_length     = PV_LENGTH_DEFAULT;
     while((optc = getopt_long(argc, argv,
-                              "hvkgdJyOaxDB:N:S:P:n:m:l:i:j:t:",
+                              "hvkgdJyOaxDUB:N:S:P:n:m:l:i:j:t:",
                               longopts, NULL))!= -1)
         switch(optc){
             case 'h':
@@ -117,6 +119,7 @@ int main(int argc, char * const argv[]) {
                 st_bounded_seconds = seconds > 0.0 ? seconds : 0.0;
                 break;
             }
+            case 'U': st_escape_uniqueness = true; break;
             case 'D': st_defender_root = true; break;
             case 'P': st_principal_string = optarg; break;
             case 'y': g_disp_search = true; break;
@@ -269,7 +272,8 @@ int main(int argc, char * const argv[]) {
         if(!g_time_limit) g_time_limit = TM_INFINATE;
         tsume_json_set_bounded_no_mate(st_bounded_plies,
                                        st_bounded_nodes,
-                                       st_bounded_seconds);
+                                       st_bounded_seconds,
+                                       st_escape_uniqueness);
 
         if(!st_json){
             //探索条件の表示
@@ -342,6 +346,8 @@ int main(int argc, char * const argv[]) {
                        st_bounded_nodes);
                 printf(",\"bounded_no_mate_seconds\":%.1f",
                        st_bounded_seconds);
+                printf(",\"escape_uniqueness_analysis\":%s",
+                       st_escape_uniqueness ? "true" : "false");
             }
             printf(",\"search_config\":{\"memory_mb\":%llu"
                    ",\"min_proof_number\":%u,\"level\":%u}",
