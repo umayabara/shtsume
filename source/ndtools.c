@@ -1826,9 +1826,31 @@ static json_line_result_t json_emit_optimal_or(
                     aborted = true;
                     break;
                 }
-                if(!best_stream ||
-                   candidate_result.attacker_hand_count >
-                       best.attacker_hand_count){
+                /* Attacker tie-break. All candidates here mate in the same
+                   number of plies, so the first key is the surplus count.
+                   When that ties too, prefer promotion over non-promotion
+                   *of the very same move*: a non-promotion that gains
+                   nothing reads as deliberate to a human, and the author
+                   flagged such a line as meaningless.
+
+                   Restricted to the same from/to squares on purpose. A
+                   blanket "prefer promoting moves" reordered unrelated
+                   moves as well, and one of those was the capture that the
+                   futile-interposition check keys on: 20161204's line
+                   stopped capturing the interposed lance and the lance
+                   flipped from futile to effective. */
+                move_t candidate_move = candidate->mlist->move;
+                bool same_square =
+                    candidate_move.prev_pos == best_move.prev_pos &&
+                    NEW_POS(candidate_move) == NEW_POS(best_move);
+                bool candidate_better =
+                    candidate_result.attacker_hand_count >
+                        best.attacker_hand_count ||
+                    (candidate_result.attacker_hand_count ==
+                         best.attacker_hand_count &&
+                     same_square &&
+                     PROMOTE(candidate_move) && !PROMOTE(best_move));
+                if(!best_stream || candidate_better){
                     if(best_stream) fclose(best_stream);
                     json_free_exclusivity(best.exclusivity);
                     best_stream = candidate_stream;
